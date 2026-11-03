@@ -23,7 +23,12 @@ out="kaggle/build"
 
 mkdir -p "$out"
 sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
-config="{'stages': 5, 'lambda': 0.5, 'games_per_stage': 10000000, 'decay_at': 5000000, 'collect': 100000, 'hours': $hours, 'margin_minutes': 20, 'threads': None, 'block': 10000, 'save_every': 200000, 'min_games': ${MIN_GAMES:-0}}"
+# Per stage (list index = stage): alpha schedule ('step' as in [MS-TD], or 'cos' annealing down to
+# alpha_min) and the value every board starts at when the stage is created (0 = [MS-TD]'s zero init,
+# e.g. 320000 = optimistic init). Only stages that have not started yet should be changed.
+anneal="['step', 'step', 'step', 'step', 'step']"
+init="[0, 0, 0, 0, 0]"
+config="{'stages': 5, 'lambda': 0.5, 'games_per_stage': 10000000, 'decay_at': 5000000, 'collect': 100000, 'hours': $hours, 'margin_minutes': 20, 'threads': None, 'block': 10000, 'save_every': 200000, 'min_games': ${MIN_GAMES:-0}, 'anneal': $anneal, 'alpha_min': 0.000025, 'init': $init}"
 
 python3 - "$sources" "$config" > "$out/train.py" <<'EOF'
 import sys

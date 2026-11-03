@@ -157,10 +157,11 @@ public:
     }
 
     // player move times of one game, in seconds (only measured when not learning)
-    void AddMoveTimes(double total, double max, size_t over_limit, std::pair<uint64_t, uint64_t> plies) {
+    void AddMoveTimes(double total, double max, size_t over_limit, const TdPlayer::MoveStats &stats) {
         std::lock_guard<std::mutex> lock(mutex_);
-        ply_sum_ += plies.first;
-        ply_moves_ += plies.second;
+        ply_sum_ += stats.ply_sum;
+        ply_moves_ += stats.ply_moves;
+        downgraded_ += stats.downgraded;
         move_time_ += total;
         move_time_max_ = std::max(move_time_max_, max);
         moves_over_limit_ += over_limit;
@@ -194,6 +195,7 @@ public:
                 << move_limit_ms << "ms=" << moves_over_limit_;
         }
         if (ply_moves_) out << std::setprecision(2) << " avg_ply=" << double(ply_sum_) / double(ply_moves_);
+        if (downgraded_) out << " downgraded_moves=" << downgraded_;
         std::cout << out.str() << std::endl;
     }
 
@@ -241,7 +243,7 @@ private:
     Acc block_acc_, total_acc_;
     double move_time_ = 0, move_time_max_ = 0;
     size_t moves_over_limit_ = 0;
-    uint64_t ply_sum_ = 0, ply_moves_ = 0;
+    uint64_t ply_sum_ = 0, ply_moves_ = 0, downgraded_ = 0;
     Clock::time_point start_, block_start_;
 };
 
@@ -433,7 +435,7 @@ int run(int argc, const char *argv[]) {
             }
 
             if (learning) learner->Learn(game);
-            if (!learning) reporter.AddMoveTimes(move_time, move_time_max, over_limit, player.TakePlyStats());
+            if (!learning) reporter.AddMoveTimes(move_time, move_time_max, over_limit, player.TakeMoveStats());
             reporter.Add(game);
 
             if (time_limit > 0) {

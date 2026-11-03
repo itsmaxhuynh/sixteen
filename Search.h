@@ -9,6 +9,40 @@
 #include "Board64.h"
 
 /**
+ * Tile-downgrading (Guei, Chen, Wu, "Optimistic Temporal Difference Learning for 2048",
+ * arXiv:2111.11090, Sec. IV.C.3), applied to the root of a search only. If the largest tile has
+ * rank >= min_rank (15 = 32768 in the paper) and some rank r below it is missing, every tile above
+ * r is halved. The downgraded board keeps the board's structure (which cells are empty and which
+ * neighbours are equal), so a move chosen on it is legal and does the same merges on the real
+ * board, while its large tiles are ones the network has seen far more often in training.
+ *
+ * r is the largest missing rank, as in the paper's example. We also require r >= 3 (8-tile), our
+ * choice: then 2- and 4-tiles keep their meaning, so the spawns inside the search stay exact.
+ * Also skipped with two or more MAX_RANK tiles: they cannot merge on our board (4-bit cells) but
+ * would after halving, so a move could be legal on the downgraded board and illegal on the real one.
+ * Returns b unchanged when the conditions do not hold.
+ */
+inline board_t DowngradeRoot(board_t b, int min_rank) {
+    unsigned present = 0;
+    int n_max = 0;
+    for (int i = 0; i < 16; ++i) {
+        int rank = int((b >> (4 * i)) & 0xf);
+        present |= 1u << rank;
+        n_max += rank == MAX_RANK;
+    }
+    int top = 31 - __builtin_clz(present | 1);
+    if (min_rank <= 0 || top < min_rank || n_max >= 2) return b;
+    int r = top - 1;
+    while (r >= 3 && ((present >> r) & 1)) --r;
+    if (r < 3) return b;
+    board_t out = b;
+    for (int i = 0; i < 16; ++i) {
+        if (int((b >> (4 * i)) & 0xf) > r) out -= board_t(1) << (4 * i); // rank k > r becomes k-1
+    }
+    return out;
+}
+
+/**
  * Expectimax search for match play ([MS-TD] Fig. 2) with
  *   - a position cache: chance-node values keyed by (afterstate, plies left, stage), kept across
  *     the moves of a game. Entries match the plies exactly, so a cached search returns exactly

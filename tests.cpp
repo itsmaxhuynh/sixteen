@@ -439,8 +439,254 @@ static void TestSearchTimed() {
     CHECK(s.Timed(full, 0, 5.0).move == -1);
 }
 
+// tile-downgrading written out on a grid: the rank r above which tiles halve (largest missing rank
+// with 3 <= r < top), or -1 when downgrading does not apply
+static int NaiveSkippedRank(board_t b, int min_rank) {
+    int top = 0, n_max = 0;
+    bool present[16] = {};
+    for (int i = 0; i < 16; ++i) {
+        int x = int((b >> (4 * i)) & 0xf);
+        present[x] = true;
+        top = std::max(top, x);
+        n_max += x == 15;
+    }
+    if (top < min_rank || n_max >= 2) return -1;
+    for (int k = top - 1; k >= 3; --k) if (!present[k]) return k;
+    return -1;
+}
+
+static board_t NaiveDowngrade(board_t b, int min_rank) {
+    int r = NaiveSkippedRank(b, min_rank);
+    int g[16];
+    for (int i = 0; i < 16; ++i) g[i] = int((b >> (4 * i)) & 0xf);
+    if (r < 0) return b;
+    board_t out = 0;
+    for (int i = 0; i < 16; ++i) out |= board_t(g[i] > r ? g[i] - 1 : g[i]) << (4 * i);
+    return out;
+}
+
+static void TestDowngrade() {
+    // ranks: 8=256 14=16384 15=32768. Paper's Fig. 10 case: 256 missing, everything above it halves
+    Board64 fig = MakeBoard({15, 14, 13, 12, 11, 10, 9, 7, 6, 5, 4, 3, 2, 1, 0, 1});
+    CHECK(DowngradeRoot(fig.GetBoard(), 15) == MakeBoard({14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 1}).GetBoard());
+    CHECK(DowngradeRoot(fig.GetBoard(), 0) == fig.GetBoard());                       // off
+    Board64 no32k = MakeBoard({14, 13, 12, 3});
+    CHECK(DowngradeRoot(no32k.GetBoard(), 15) == no32k.GetBoard());                  // largest tile too small
+    CHECK(DowngradeRoot(no32k.GetBoard(), 14) == MakeBoard({13, 12, 11, 3}).GetBoard()); // lower threshold
+    CHECK(DowngradeRoot(MakeBoard({15, 3, 1}).GetBoard(), 15) == MakeBoard({14, 3, 1}).GetBoard()); // r = 14
+    Board64 full = MakeBoard({15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1});
+    CHECK(DowngradeRoot(full.GetBoard(), 15) == full.GetBoard());                    // only 2 or 4 missing
+    Board64 two_max = MakeBoard({15, 15, 3});
+    CHECK(DowngradeRoot(two_max.GetBoard(), 15) == two_max.GetBoard());              // 32768 pair: skipped
+
+    // random boards with large tiles: same as the naive version, and every move is legal on both
+    // boards and gives the downgraded result of the real move
+    std::mt19937_64 rng(77);
+    int applied = 0, bad = 0;
+    for (int k = 0; k < 200000; ++k) {
+        board_t b = 0;
+        for (int i = 0; i < 16; ++i) b |= board_t(rng() % 4 ? rng() % 16 : 0) << (4 * i);
+        if (k % 2) b = (b & ~board_t(0xf)) | 15; // half of them hold a 32768 in cell 0
+        board_t d = DowngradeRoot(b, 15);
+        bad += d != NaiveDowngrade(b, 15);
+        if (d == b) continue;
+        ++applied;
+        int r = NaiveSkippedRank(b, 15);
+        for (int dir = 0; dir < 4; ++dir) {
+            Board64 rb(b), db(d);
+            reward_t rr = rb.Slide(dir), dr = db.Slide(dir);
+            bad += (rr == -1) != (dr == -1);
+            if (rr == -1) continue;
+            board_t want = 0;
+            for (int i = 0; i < 16; ++i) {
+                int x = rb(i);
+                want |= board_t(x > r ? x - 1 : x) << (4 * i);
+            }
+            bad += db.GetBoard() != want;
+        }
+    }
+    CHECK(applied > 10000 && bad == 0);
+}
+
+// TdPlayer with downgrade=: the move is the plain player's move on the downgraded board, valued
+// with the stage of the downgraded board; boards it does not apply to are played as before
+static void TestDowngradePlayer() {
+    std::vector<std::vector<int>> small = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}};
+    NTupleNetwork net(5, kFeatAll, small);
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> w(-1000, 1000);
+    for (int s = 0; s < 5; ++s) {
+        net.InitStage(s);
+        for (auto &table : net.StageWeights(s)) for (float &x : table) x = w(rng);
+    }
+    TrainingState st;
+    st.active = 4;
+    st.games = {1, 1, 1, 1, 1};
+    std::string path = "/tmp/sixteen-downgrade.ckpt";
+    if (const char *dir = std::getenv("TMPDIR")) path = std::string(dir) + "/sixteen-downgrade.ckpt";
+    net.Save(path, st);
+
+    for (const char *search : {"ply=1", "ply=2", "ply=3 tt=12", "time=10000 maxply=2 tt=12"}) {
+        TdPlayer plain("load=" + path + " " + search);
+        TdPlayer down(plain.shared_learner(), std::string("downgrade=32768 ") + search);
+        TdPlayer fresh(plain.shared_learner(), search);
+        int same = 0, differ_stage = 0, n = 0, bad = 0;
+        uint64_t expected_downgrades = 0;
+        for (int k = 0; k < 400; ++k) {
+            Board64 b;
+            for (int i = 0; i < 16; ++i) b.Set(i, rng() % 3 ? rng() % 12 : 0);
+            if (k % 2) { b.Set(rng() % 16, 15); b.Set(rng() % 16, 14); b.Set(rng() % 16, 13); }
+            if (b.IsTerminal()) continue;
+            ++n;
+            board_t d = DowngradeRoot(b.GetBoard(), 15);
+            down.OpenEpisode();
+            int got = down.TakeAction(b).event() & 0b11;
+            plain.OpenEpisode();
+            int want;
+            if (d == b.GetBoard()) {
+                want = plain.TakeAction(b).event() & 0b11;
+                same++;
+            } else {
+                expected_downgrades++;
+                // the real board's stage differs from the downgraded one's for many of these boards
+                differ_stage += SplitLevel(b.GetBoard(), 4) != SplitLevel(d, 4);
+                fresh.OpenEpisode();
+                want = fresh.TakeAction(Board64(d)).event() & 0b11;
+            }
+            bad += got != want;
+            Board64 c = b;
+            bad += c.Slide(got) == -1;
+        }
+        CHECK(n > 300 && same > 50 && expected_downgrades > 50 && differ_stage > 20 && bad == 0);
+        CHECK(down.TakeMoveStats().downgraded == expected_downgrades);
+    }
+    std::remove(path.c_str());
+}
+
+// small checkpoint for learner tests: random stage-0 weights, stage 1 not created yet
+static std::string SmallCheckpoint(const std::string &name, uint64_t games0) {
+    NTupleNetwork net(2, kFeatAll, {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}});
+    net.InitStage(0);
+    std::mt19937 rng(11);
+    std::uniform_real_distribution<float> w(-50, 50);
+    for (auto &table : net.StageWeights(0)) for (float &x : table) x = w(rng);
+    TrainingState st;
+    st.active = 0;
+    st.games = {games0, 0};
+    std::string path = "/tmp/" + name;
+    if (const char *dir = std::getenv("TMPDIR")) path = std::string(dir) + "/" + name;
+    net.Save(path, st);
+    return path;
+}
+
+// one game by a greedy player of `learner` against a seeded environment, and its afterstates
+static Episode PlayGame(std::shared_ptr<TdLearner> learner, unsigned seed, std::vector<board_t> *boards) {
+    TdPlayer player(learner, "ply=1");
+    RandomEnvironment evil("seed=" + std::to_string(seed));
+    Episode game;
+    player.OpenEpisode();
+    while (true) {
+        Agent &agent = game.TakeTurns(player, evil);
+        if (!game.ApplyAction(agent.TakeAction(game.state()))) break;
+    }
+    for (const Episode::Move &m : game.GetMoves()) boards->push_back(m.board);
+    return game;
+}
+
+static std::shared_ptr<TdLearner> MakeLearner(const std::string &args) {
+    std::map<std::string, std::string> kv;
+    std::stringstream ss(args);
+    for (std::string pair; ss >> pair;) kv[pair.substr(0, pair.find('='))] = pair.substr(pair.find('=') + 1);
+    return std::make_shared<TdLearner>(kv);
+}
+
+static void TestCosineAnnealing() {
+    std::string at0 = SmallCheckpoint("sixteen-cos0.ckpt", 0);
+    std::string at500 = SmallCheckpoint("sixteen-cos500.ckpt", 500);
+    std::string at1000 = SmallCheckpoint("sixteen-cos1000.ckpt", 1000);
+    const std::string cos = " anneal=cos anneal_games=1000 alpha=0.01 alpha_min=0.001";
+
+    // the schedule itself
+    auto c = MakeLearner("load=" + at0 + cos);
+    CHECK(c->Alpha(0) == 0.01f);
+    CHECK(std::fabs(c->Alpha(500) - 0.0055f) < 1e-7f);
+    CHECK(std::fabs(c->Alpha(250) - (0.001f + 0.009f * 0.5f * (1 + std::cos(M_PI / 4)))) < 1e-7f);
+    CHECK(c->Alpha(1000) == 0.001f && c->Alpha(5000) == 0.001f);
+    bool monotone = true;
+    for (uint64_t g = 1; g <= 1100; ++g) monotone &= c->Alpha(g) <= c->Alpha(g - 1);
+    CHECK(monotone);
+    CHECK(MakeLearner("load=" + at500 + " alpha=0.01")->Alpha(500) == 0.01f); // off: alpha as given
+
+    // Learn uses the alpha of the stage's game count (carried by the checkpoint): a cosine learner
+    // at game g learns exactly like a plain learner with alpha = Alpha(g)
+    for (const std::string &ckpt : {at0, at500, at1000}) {
+        auto annealed = MakeLearner("load=" + ckpt + cos);
+        char alpha[32];
+        std::snprintf(alpha, sizeof alpha, "%.9g", annealed->Alpha(annealed->ActiveGames()));
+        auto plain = MakeLearner("load=" + ckpt + " alpha=" + alpha);
+        auto other = MakeLearner("load=" + ckpt + " alpha=0.004"); // a different alpha must differ
+        std::vector<board_t> boards;
+        Episode game = PlayGame(plain, 3, &boards);
+        annealed->Learn(game);
+        plain->Learn(game);
+        other->Learn(game);
+        int differ = 0, differ_other = 0;
+        for (board_t b : boards) {
+            differ += annealed->Evaluate(b, 0) != plain->Evaluate(b, 0);
+            differ_other += other->Evaluate(b, 0) != plain->Evaluate(b, 0);
+        }
+        CHECK(boards.size() > 100 && differ == 0 && differ_other > 0);
+        CHECK(annealed->ActiveGames() == plain->ActiveGames());
+    }
+    // alpha follows the games learned in this run, not only the count loaded from the checkpoint:
+    // over 2 games alpha anneals to 0, so a third game changes nothing
+    auto quick = MakeLearner("load=" + at0 + " anneal=cos anneal_games=2 alpha=0.01 alpha_min=0");
+    std::vector<board_t> boards;
+    quick->Learn(PlayGame(quick, 4, &boards));
+    quick->Learn(PlayGame(quick, 5, &boards));
+    std::vector<float> before;
+    for (board_t b : boards) before.push_back(quick->Evaluate(b, 0));
+    std::vector<board_t> third;
+    quick->Learn(PlayGame(quick, 6, &third));
+    int changed = 0;
+    for (size_t i = 0; i < boards.size(); ++i) changed += quick->Evaluate(boards[i], 0) != before[i];
+    CHECK(quick->ActiveGames() == 3 && changed == 0);
+    for (const std::string &p : {at0, at500, at1000}) std::remove(p.c_str());
+}
+
+static void TestOptimisticInit() {
+    std::string ckpt = SmallCheckpoint("sixteen-oi.ckpt", 7);
+    auto base = MakeLearner("load=" + ckpt);
+    auto zero = MakeLearner("load=" + ckpt + " stage=1");
+    auto oi = MakeLearner("load=" + ckpt + " stage=1 init=500");
+    std::mt19937_64 rng(3);
+    int bad = 0;
+    for (int k = 0; k < 2000; ++k) {
+        board_t b = 0;
+        for (int i = 0; i < 16; ++i) b |= board_t(rng() % 3 ? rng() % 15 : 0) << (4 * i);
+        // the new stage values every board at V; stage 0 is untouched
+        bad += std::fabs(oi->Evaluate(b, 1) - 500.0f) > 0.01f;
+        bad += zero->Evaluate(b, 1) != 0.0f;
+        if (SplitLevel(b, 1) == 0) bad += oi->Evaluate(b, 0) != base->Evaluate(b, 0);
+    }
+    CHECK(bad == 0);
+    // init= does not touch a stage that already exists
+    auto again = MakeLearner("load=" + ckpt + " init=500");
+    Board64 b = MakeBoard({1, 2, 3, 0, 5});
+    CHECK(again->Evaluate(b.GetBoard(), 0) == base->Evaluate(b.GetBoard(), 0));
+    std::remove(ckpt.c_str());
+
+    // a fresh network (default patterns, 4 x 8 tuples + 5 scalar features) starts at V too
+    auto fresh = MakeLearner("stages=1 init=320000");
+    CHECK(std::fabs(fresh->Evaluate(b.GetBoard(), 0) - 320000.0f) < 1.0f);
+}
+
 int main() {
     InitLookUpTables();
+    TestCosineAnnealing();
+    TestOptimisticInit();
+    TestDowngrade();
+    TestDowngradePlayer();
     TestSearchExact();
     TestSearchTimed();
     TestFastTupleIndices();

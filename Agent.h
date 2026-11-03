@@ -108,6 +108,13 @@ public:
  * Args (key=value):
  *   load=<ckpt> save=<ckpt>
  *   alpha=<f>     per-weight step size, paper: 0.0025, then 0.00025 once saturated
+ *   anneal=cos anneal_games=<G> alpha_min=<f>
+ *                 cosine annealing instead of a fixed alpha: the active stage's game g (counted
+ *                 across sessions) trains with alpha_min + (alpha - alpha_min)(1 + cos(pi g / G)) / 2,
+ *                 then alpha_min from game G on. Off by default: alpha is used as given.
+ *   init=<V>      optimistic initialization (arXiv:2111.11090 eq. 12): a stage created by this run
+ *                 starts with every weight at V / (features per state), so every board is valued V
+ *                 (default 0, as in [MS-TD]). Stages that already exist are not touched.
  *   lambda=<f>    paper's final version: 0.5 with returns truncated at 5 steps; 0 = TD(0)
  *   stage=<k>     0-based stage to train (and highest stage used to play); a new stage starts at zero
  *   stages=<n> features=<all|none|mask>   only used when starting fresh (default 5 / all)
@@ -120,23 +127,41 @@ public:
     explicit TdLearner(const std::map<std::string, std::string> &args)
             : network_(Get(args, "stages") ? std::stoi(*Get(args, "stages")) : kMaxStages,
                        Get(args, "features") ? ParseFeatures(*Get(args, "features")) : kFeatAll) {
+        if (const std::string *v = Get(args, "init")) init_value_ = std::stof(*v);
         if (const std::string *file = Get(args, "load")) {
             network_.Load(*file, state_);
             std::cerr << "loaded " << *file << std::endl;
         } else {
             state_.games.assign(network_.NumStages(), 0);
-            network_.InitStage(0);
+            InitStage(0);
         }
         if (const std::string *v = Get(args, "stage")) SetActiveStage(std::stoi(*v));
         // command line overrides what the checkpoint carried
         if (const std::string *v = Get(args, "alpha")) state_.alpha = std::stof(*v);
         if (const std::string *v = Get(args, "lambda")) state_.lambda = std::stof(*v);
         if (const std::string *v = Get(args, "save")) save_path_ = *v;
+        if (const std::string *v = Get(args, "anneal")) {
+            if (*v == "cos") cosine_ = true;
+            else if (*v != "none") throw std::invalid_argument("anneal must be cos or none");
+        }
+        if (const std::string *v = Get(args, "anneal_games")) anneal_games_ = std::stod(*v);
+        if (const std::string *v = Get(args, "alpha_min")) alpha_min_ = std::stof(*v);
+        if (cosine_ && !(anneal_games_ > 0)) throw std::invalid_argument("anneal=cos needs anneal_games > 0");
         active_games_ = state_.games[state_.active];
 
         network_.PrintSummary(std::cerr);
         std::cerr << "learner: active stage " << state_.active << ", games/stage " << GamesString()
-                  << ", alpha=" << state_.alpha << ", lambda=" << state_.lambda << std::endl;
+                  << ", alpha=" << state_.alpha << ", lambda=" << state_.lambda;
+        if (cosine_) std::cerr << ", cosine annealing to " << alpha_min_ << " over " << anneal_games_
+                               << " games (now " << Alpha(active_games_.load()) << ")";
+        std::cerr << std::endl;
+    }
+
+    // step size for a game that starts when the active stage has `games` games behind it
+    float Alpha(uint64_t games) const {
+        if (!cosine_) return state_.alpha;
+        double progress = std::min(1.0, double(games) / anneal_games_);
+        return float(alpha_min_ + (state_.alpha - alpha_min_) * 0.5 * (1.0 + std::cos(M_PI * progress)));
     }
 
     /**
@@ -163,12 +188,13 @@ public:
             stage[t] = Resolve(gs);
         }
 
+        const float alpha = Alpha(active_games_.load(std::memory_order_relaxed));
         std::vector<float> value(T); // V(s'_t) after its own update
         for (size_t t = T; t-- > 0;) {
             float target = LambdaReturn(rewards, value, t, state_.lambda, kReturns);
             if (stage[t] == state_.active) {
                 float v = network_.GetValue(after[t], stage[t]);
-                network_.UpdateValue(after[t], stage[t], state_.alpha * (target - v));
+                network_.UpdateValue(after[t], stage[t], alpha * (target - v));
             }
             value[t] = network_.GetValue(after[t], stage[t]);
         }
@@ -210,7 +236,9 @@ public:
         if (save_path_.empty()) return;
         state_.games[state_.active] = active_games_.load();
         network_.Save(save_path_, state_);
-        std::cerr << "saved " << save_path_ << " (games/stage " << GamesString() << ")" << std::endl;
+        std::cerr << "saved " << save_path_ << " (games/stage " << GamesString();
+        if (cosine_) std::cerr << ", alpha now " << Alpha(active_games_.load());
+        std::cerr << ")" << std::endl;
     }
 
     bool CanSave() const { return !save_path_.empty(); }
@@ -243,10 +271,7 @@ private:
         for (int s = 0; s < stage; ++s) {
             if (!network_.Initialized(s)) throw std::invalid_argument("stage " + std::to_string(s) + " is not trained yet");
         }
-        if (!network_.Initialized(stage)) {
-            network_.InitStage(stage);
-            std::cerr << "stage " << stage << " initialized to zero" << std::endl;
-        }
+        if (!network_.Initialized(stage)) InitStage(stage);
         state_.active = stage;
     }
 
@@ -254,6 +279,14 @@ private:
         std::string s;
         for (size_t i = 0; i < state_.games.size(); ++i) s += (i ? "," : "") + std::to_string(state_.games[i]);
         return s;
+    }
+
+    // a new stage: zero ([MS-TD]) or optimistic, so that every board is valued init_value_
+    void InitStage(int stage) {
+        float w = init_value_ / float(network_.NumActiveFeatures());
+        network_.InitStage(stage, w);
+        std::cerr << "stage " << stage << " initialized to " << w << " per weight (boards valued "
+                  << init_value_ << ")" << std::endl;
     }
 
     int Resolve(int game_stage) const { return std::min(game_stage, state_.active); }
@@ -298,6 +331,10 @@ private:
     }
 
     std::string save_path_;
+    float init_value_ = 0;
+    bool cosine_ = false;
+    double anneal_games_ = 0;
+    float alpha_min_ = 0;
     TrainingState state_;
     std::atomic<uint64_t> active_games_{0};
     NTupleNetwork network_;
@@ -312,6 +349,8 @@ private:
  *                (hard=<ms> aborts an unfinished depth, default = time; maxply=<n> caps it, default 8)
  *   tt=<k>       position cache of 2^k entries x 16 bytes (default 22 = 64 MB, 0 = off)
  *   prune=<p>    do not search spawn outcomes whose path probability is below p (default 0 = off)
+ *   downgrade=<tile>  tile-downgrading at the root once the largest tile is >= tile, e.g. 32768
+ *                (see DowngradeRoot in Search.h; default 0 = off)
  * Search (ply > 1 or time=) goes through Search.h; ply=1 stays on the cheap training path.
  */
 class TdPlayer : public Agent {
@@ -342,12 +381,23 @@ public:
 
     Action TakeAction(const Board64 &board) override {
         game_stage_ = std::max(game_stage_, learner_->Split(board.GetBoard()));
+        // the search runs on the downgraded board, valued as a board of its own (stage from its tiles)
+        Board64 root = board;
+        int stage = game_stage_;
+        if (downgrade_rank_ > 0) {
+            board_t d = DowngradeRoot(board.GetBoard(), downgrade_rank_);
+            if (d != board.GetBoard()) {
+                root = Board64(d);
+                stage = learner_->Split(d);
+                downgraded_++;
+            }
+        }
         int move;
         if (!search_) {
-            move = learner_->BestMove(board, ply_, game_stage_);
+            move = learner_->BestMove(root, ply_, stage);
         } else {
-            Search<TdLearner>::Result r = time_ms_ > 0 ? search_->Timed(board, game_stage_, time_ms_, hard_ms_, max_ply_)
-                                                       : search_->Fixed(board, ply_, game_stage_);
+            Search<TdLearner>::Result r = time_ms_ > 0 ? search_->Timed(root, stage, time_ms_, hard_ms_, max_ply_)
+                                                       : search_->Fixed(root, ply_, stage);
             move = r.move;
             ply_sum_ += r.ply;
             ply_moves_++;
@@ -357,10 +407,15 @@ public:
 
     std::shared_ptr<TdLearner> shared_learner() const { return learner_; }
 
-    // depth statistics of the searched moves since the last call: {sum of plies, moves}
-    std::pair<uint64_t, uint64_t> TakePlyStats() {
-        std::pair<uint64_t, uint64_t> s{ply_sum_, ply_moves_};
-        ply_sum_ = ply_moves_ = 0;
+    struct MoveStats {
+        uint64_t ply_sum = 0, ply_moves = 0; // depth of the searched moves
+        uint64_t downgraded = 0;             // moves chosen on a downgraded board
+    };
+
+    // statistics of the moves since the last call
+    MoveStats TakeMoveStats() {
+        MoveStats s{ply_sum_, ply_moves_, downgraded_};
+        ply_sum_ = ply_moves_ = downgraded_ = 0;
         return s;
     }
 
@@ -372,6 +427,13 @@ private:
         hard_ms_ = Has("hard") ? double(meta_["hard"]) : 0;
         max_ply_ = Has("maxply") ? int(meta_["maxply"]) : 8;
         if (max_ply_ < 1) throw std::invalid_argument("maxply must be >= 1");
+        downgrade_rank_ = 0;
+        if (Has("downgrade")) {
+            unsigned tile = unsigned(meta_["downgrade"]);
+            if (tile != 0 && (tile < 16 || (tile & (tile - 1)) || tile > 32768))
+                throw std::invalid_argument("downgrade must be 0 or a tile 16..32768");
+            if (tile) downgrade_rank_ = __builtin_ctz(tile);
+        }
         if (ply_ > 1 || time_ms_ > 0) {
             search_.reset(new Search<TdLearner>(*learner_, Has("tt") ? int(meta_["tt"]) : 22));
             if (Has("prune")) search_->SetPrune(float(meta_["prune"]));
@@ -384,5 +446,6 @@ private:
     double time_ms_ = 0, hard_ms_ = 0;
     int max_ply_ = 8;
     int game_stage_ = 0;
-    uint64_t ply_sum_ = 0, ply_moves_ = 0;
+    int downgrade_rank_ = 0;
+    uint64_t ply_sum_ = 0, ply_moves_ = 0, downgraded_ = 0;
 };

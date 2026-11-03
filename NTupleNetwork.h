@@ -234,10 +234,11 @@ public:
 
     bool Initialized(int stage) const { return initialized_[stage]; }
 
-    // allocates a zero-initialized stage ([MS-TD] Sec. III: "feature weights are all initialized to be zero")
-    void InitStage(int stage) {
+    // allocates a stage with every weight = value: 0 by default ([MS-TD] Sec. III: "feature weights are
+    // all initialized to be zero"), or an optimistic value (arXiv:2111.11090)
+    void InitStage(int stage, float value = 0.0f) {
         if (initialized_[stage]) return;
-        for (size_t t = 0; t < weights_[stage].size(); ++t) weights_[stage][t].assign(TableSize(t), 0.0f);
+        for (size_t t = 0; t < weights_[stage].size(); ++t) weights_[stage][t].assign(TableSize(t), value);
         initialized_[stage] = true;
     }
 
