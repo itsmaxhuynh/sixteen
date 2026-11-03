@@ -1,0 +1,10 @@
+sixteen
+tests
+*.ckpt
+*.ckpt.tmp
+kaggle/build/
+weights/
+arena-link-*
+*.log
+kaggle/runs/
+.remember/

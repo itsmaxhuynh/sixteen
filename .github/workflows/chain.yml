@@ -1,0 +1,77 @@
+# Keeps Kaggle training going without a machine of ours being on: every 30 minutes, if the Kaggle
+# session has finished, kaggle/chain.sh verifies its checkpoint and pushes the next session.
+# The pushed session embeds the sources of this branch, so code changes take effect once pushed here.
+#
+# Needs the repository secret KAGGLE_API_TOKEN (the KGAT_... token from ~/.kaggle/access_token).
+# When the chain halts or finishes, this opens an issue (and a halted run fails, which also emails).
+name: chain kaggle sessions
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: chain
+  cancel-in-progress: false
+
+jobs:
+  chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kaggle CLI
+        env:
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
+        run: |
+          pip install --quiet kaggle==2.2.5 six
+          mkdir -p ~/.kaggle
+          printf '%s' "$KAGGLE_API_TOKEN" > ~/.kaggle/access_token
+          chmod 600 ~/.kaggle/access_token
+
+      - name: Chain
+        id: chain
+        run: kaggle/chain.sh itsmaxhuynh
+
+      - name: Save chain state
+        if: always()
+        run: |
+          git add kaggle/chain-state kaggle/chain-history 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -m "chain: update state"
+            git pull --rebase --quiet
+            git push
+          fi
+
+      - name: Keep the session log
+        if: always() && hashFiles('kaggle/runs/latest/train.log') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: train-log-${{ github.run_id }}
+          path: kaggle/runs/latest/train.log
+          retention-days: 14
+
+      - name: Open an issue when the chain stops
+        if: always() && (steps.chain.outputs.halted != '' || steps.chain.outputs.done == '1')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REASON: ${{ steps.chain.outputs.halted }}
+          DONE: ${{ steps.chain.outputs.done }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$DONE" = 1 ]; then
+            title="Kaggle training finished: all stages trained"
+            body="The chain stopped because every stage is trained. Run: $RUN_URL"
+          else
+            title="Kaggle chain halted"
+            body=$(printf 'Reason: %s\n\nNothing was pushed. Fix the cause, then clear `halted=` in kaggle/chain-state and push.\n\nRun: %s' "$REASON" "$RUN_URL")
+          fi
+          gh issue create --title "$title" --body "$body"
