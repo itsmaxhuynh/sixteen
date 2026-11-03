@@ -117,7 +117,11 @@ public:
  *                 (default 0, as in [MS-TD]). Stages that already exist are not touched.
  *   lambda=<f>    paper's final version: 0.5 with returns truncated at 5 steps; 0 = TD(0)
  *   stage=<k>     0-based stage to train (and highest stage used to play); a new stage starts at zero
- *   stages=<n> features=<all|none|mask>   only used when starting fresh (default 5 / all)
+ *   tc=1          temporal coherence learning (arXiv:2111.11090 eqs. 7-9) instead of plain TD: each
+ *                 weight's step is alpha * |E|/A. E and A (2 floats per weight of the active stage)
+ *                 are saved to <save>.tc and read back from <load>.tc when it holds the same stage.
+ *   stages=<n> features=<all|none|mask> patterns=<4x6|8x6>   only used when starting fresh
+ *                 (default 5 / all / 4x6)
  */
 class TdLearner {
 public:
@@ -126,7 +130,8 @@ public:
     // args: the key=value pairs of --play (ply is read by TdPlayer)
     explicit TdLearner(const std::map<std::string, std::string> &args)
             : network_(Get(args, "stages") ? std::stoi(*Get(args, "stages")) : kMaxStages,
-                       Get(args, "features") ? ParseFeatures(*Get(args, "features")) : kFeatAll) {
+                       Get(args, "features") ? ParseFeatures(*Get(args, "features")) : kFeatAll,
+                       NTupleNetwork::NamedPatterns(Get(args, "patterns") ? *Get(args, "patterns") : "4x6")) {
         if (const std::string *v = Get(args, "init")) init_value_ = std::stof(*v);
         if (const std::string *file = Get(args, "load")) {
             network_.Load(*file, state_);
@@ -148,12 +153,26 @@ public:
         if (const std::string *v = Get(args, "alpha_min")) alpha_min_ = std::stof(*v);
         if (cosine_ && !(anneal_games_ > 0)) throw std::invalid_argument("anneal=cos needs anneal_games > 0");
         active_games_ = state_.games[state_.active];
+        if (const std::string *v = Get(args, "tc")) tc_ = *v == "1";
+        if (tc_) {
+            const std::string *file = Get(args, "load");
+            if (!file || !LoadTC(*file + ".tc")) {
+                tc_e_.resize(network_.NumTables());
+                tc_a_.resize(network_.NumTables());
+                for (size_t t = 0; t < network_.NumTables(); ++t) {
+                    tc_e_[t].assign(network_.TableSize(t), 0.0f);
+                    tc_a_[t].assign(network_.TableSize(t), 0.0f);
+                }
+                std::cerr << "TC: E and A start at zero for stage " << state_.active << std::endl;
+            }
+        }
 
         network_.PrintSummary(std::cerr);
         std::cerr << "learner: active stage " << state_.active << ", games/stage " << GamesString()
                   << ", alpha=" << state_.alpha << ", lambda=" << state_.lambda;
         if (cosine_) std::cerr << ", cosine annealing to " << alpha_min_ << " over " << anneal_games_
                                << " games (now " << Alpha(active_games_.load()) << ")";
+        if (tc_) std::cerr << ", TC learning";
         std::cerr << std::endl;
     }
 
@@ -194,7 +213,8 @@ public:
             float target = LambdaReturn(rewards, value, t, state_.lambda, kReturns);
             if (stage[t] == state_.active) {
                 float v = network_.GetValue(after[t], stage[t]);
-                network_.UpdateValue(after[t], stage[t], alpha * (target - v));
+                if (tc_) network_.UpdateValueTC(after[t], stage[t], alpha, target - v, tc_e_, tc_a_);
+                else network_.UpdateValue(after[t], stage[t], alpha * (target - v));
             }
             value[t] = network_.GetValue(after[t], stage[t]);
         }
@@ -236,12 +256,18 @@ public:
         if (save_path_.empty()) return;
         state_.games[state_.active] = active_games_.load();
         network_.Save(save_path_, state_);
+        // the .tc file beside a checkpoint belongs to it: write it, or drop a stale one
+        if (tc_) SaveTC(save_path_ + ".tc");
+        else std::remove((save_path_ + ".tc").c_str());
         std::cerr << "saved " << save_path_ << " (games/stage " << GamesString();
         if (cosine_) std::cerr << ", alpha now " << Alpha(active_games_.load());
         std::cerr << ")" << std::endl;
     }
 
     bool CanSave() const { return !save_path_.empty(); }
+
+    // true if TC state was read from a .tc file (false: E and A started at zero)
+    bool TCLoaded() const { return tc_loaded_; }
 
     int ActiveStage() const { return state_.active; }
 
@@ -279,6 +305,65 @@ private:
         std::string s;
         for (size_t i = 0; i < state_.games.size(); ++i) s += (i ? "," : "") + std::to_string(state_.games[i]);
         return s;
+    }
+
+    /*
+     * TC file: char[8] "SIXTEENT", u32 stage, u32 n_tables, u64 size of each table, then the E
+     * tables and the A tables as f32. Written to .tmp and renamed.
+     */
+    void SaveTC(const std::string &path) const {
+        std::string tmp = path + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+            if (!out) throw std::runtime_error("cannot open " + tmp);
+            out.write("SIXTEENT", 8);
+            uint32_t stage = uint32_t(state_.active), n = uint32_t(tc_e_.size());
+            out.write(reinterpret_cast<const char *>(&stage), 4);
+            out.write(reinterpret_cast<const char *>(&n), 4);
+            for (const auto &t : tc_e_) {
+                uint64_t size = t.size();
+                out.write(reinterpret_cast<const char *>(&size), 8);
+            }
+            for (const auto *arrays : {&tc_e_, &tc_a_}) {
+                for (const auto &t : *arrays) out.write(reinterpret_cast<const char *>(t.data()), t.size() * sizeof(float));
+            }
+            out.flush();
+            if (!out) throw std::runtime_error("write failed for " + tmp);
+        }
+        if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("cannot rename " + tmp);
+    }
+
+    // true if path holds TC state for the active stage with this network's table sizes
+    bool LoadTC(const std::string &path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        char magic[8];
+        uint32_t stage = 0, n = 0;
+        in.read(magic, 8);
+        in.read(reinterpret_cast<char *>(&stage), 4);
+        in.read(reinterpret_cast<char *>(&n), 4);
+        if (!in || std::memcmp(magic, "SIXTEENT", 8) != 0 || n != network_.NumTables()) return false;
+        if (int(stage) != state_.active) {
+            std::cerr << "TC: " << path << " is for stage " << stage << ", not " << state_.active << ", ignored" << std::endl;
+            return false;
+        }
+        std::vector<std::vector<float>> e(n), a(n);
+        for (uint32_t t = 0; t < n; ++t) {
+            uint64_t size = 0;
+            in.read(reinterpret_cast<char *>(&size), 8);
+            if (!in || size != network_.TableSize(t)) return false;
+            e[t].resize(size);
+            a[t].resize(size);
+        }
+        for (auto *arrays : {&e, &a}) {
+            for (auto &t : *arrays) in.read(reinterpret_cast<char *>(t.data()), t.size() * sizeof(float));
+        }
+        if (!in) throw std::runtime_error("TC file " + path + " is truncated");
+        tc_e_ = std::move(e);
+        tc_a_ = std::move(a);
+        tc_loaded_ = true;
+        std::cerr << "TC: loaded " << path << std::endl;
+        return true;
     }
 
     // a new stage: zero ([MS-TD]) or optimistic, so that every board is valued init_value_
@@ -332,6 +417,8 @@ private:
 
     std::string save_path_;
     float init_value_ = 0;
+    bool tc_ = false, tc_loaded_ = false;
+    std::vector<std::vector<float>> tc_e_, tc_a_; // TC accumulators of the active stage
     bool cosine_ = false;
     double anneal_games_ = 0;
     float alpha_min_ = 0;

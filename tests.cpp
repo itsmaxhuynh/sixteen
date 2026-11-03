@@ -681,8 +681,139 @@ static void TestOptimisticInit() {
     CHECK(std::fabs(fresh->Evaluate(b.GetBoard(), 0) - 320000.0f) < 1.0f);
 }
 
+// generic fast path (any patterns) == Pattern::Index reference, for 8x6 and a small network;
+// FeatureIndices lists the weights the reference sums, for default patterns too
+static void TestGenericValue() {
+    std::vector<board_t> boards = TestBoards();
+    for (auto patterns : {NTupleNetwork::Patterns8x6(), std::vector<std::vector<int>>{{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}, {3, 6, 9}},
+                          NTupleNetwork::DefaultPatterns()}) {
+        NTupleNetwork net(1, kFeatAll, patterns);
+        net.InitStage(0);
+        uint64_t x = 88172645463325252ULL; // xorshift: fast enough for 134M weights
+        for (std::vector<float> &table : net.StageWeights(0)) {
+            for (float &w : table) {
+                x ^= x << 13, x ^= x >> 7, x ^= x << 17;
+                w = float(int64_t(x % 2000001) - 1000000) * 0.001f;
+            }
+        }
+        int bad = 0, bad_list = 0;
+        for (size_t k = 0; k < boards.size(); k += (patterns.size() == 8 ? 3 : 1)) {
+            board_t b = boards[k];
+            float ref = net.GetValueReference(b, 0);
+            bad += net.GetValue(b, 0) != ref;
+            uint32_t table[NTupleNetwork::kMaxFeatures];
+            size_t index[NTupleNetwork::kMaxFeatures];
+            int n = net.FeatureIndices(b, table, index);
+            float sum = 0;
+            for (int i = 0; i < n; ++i) sum += net.StageWeights(0)[table[i]][index[i]];
+            bad_list += n != net.NumActiveFeatures() || sum != ref;
+        }
+        CHECK(bad == 0 && bad_list == 0);
+        CHECK(net.FastTuples() == (patterns == NTupleNetwork::DefaultPatterns()));
+
+        // updates: from zero weights, fast +1 then reference -1 restores all zeros
+        for (std::vector<float> &t : net.StageWeights(0)) std::fill(t.begin(), t.end(), 0.0f);
+        int moved = 0;
+        for (size_t k = 0; k < boards.size(); k += 997) {
+            net.UpdateValue(boards[k], 0, 1.0f);
+            moved += net.GetValueReference(boards[k], 0) != 0.0f;
+            net.UpdateValueReference(boards[k], 0, -1.0f);
+        }
+        bad = 0;
+        for (const std::vector<float> &t : net.StageWeights(0)) for (float w : t) bad += w != 0.0f;
+        CHECK(bad == 0 && moved > 100);
+    }
+}
+
+// TC update, eqs. 7-9 of arXiv:2111.11090, on a board whose weights are all distinct
+static void TestTCUpdate() {
+    NTupleNetwork net(1, kFeatAll, {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}});
+    net.InitStage(0);
+    std::vector<std::vector<float>> E(net.NumTables()), A(net.NumTables());
+    for (size_t t = 0; t < net.NumTables(); ++t) E[t].assign(net.TableSize(t), 0), A[t].assign(net.TableSize(t), 0);
+    std::mt19937_64 rng(9);
+    board_t b = 0;
+    uint32_t table[NTupleNetwork::kMaxFeatures];
+    size_t index[NTupleNetwork::kMaxFeatures];
+    int n = 0;
+    for (bool distinct = false; !distinct;) {
+        b = rng();
+        n = net.FeatureIndices(b, table, index);
+        std::set<std::pair<uint32_t, size_t>> seen;
+        for (int i = 0; i < n; ++i) seen.insert({table[i], index[i]});
+        distinct = int(seen.size()) == n;
+    }
+    // errors 2, -1, 3 with alpha 0.5: beta = 1 (A = 0), then |2|/2 = 1, then |1|/3
+    //   w: 0 -> 1 -> 0.5 -> 0.5 + 0.5 * (1/3) * 3 = 1;  E: 2, 1, 4;  A: 2, 3, 6
+    net.UpdateValueTC(b, 0, 0.5f, 2.0f, E, A);
+    net.UpdateValueTC(b, 0, 0.5f, -1.0f, E, A);
+    net.UpdateValueTC(b, 0, 0.5f, 3.0f, E, A);
+    int bad = 0;
+    for (int i = 0; i < n; ++i) {
+        bad += std::fabs(net.StageWeights(0)[table[i]][index[i]] - 1.0f) > 1e-6f;
+        bad += E[table[i]][index[i]] != 4.0f || A[table[i]][index[i]] != 6.0f;
+    }
+    float untouched = 0;
+    for (size_t t = 0; t < net.NumTables(); ++t) for (float w : net.StageWeights(0)[t]) untouched += std::fabs(w);
+    CHECK(bad == 0 && std::fabs(untouched - float(n)) < 1e-3f);
+
+    // negative E: beta uses |E|. errors -2, -1, 3: beta 1, 1, |-3|/3 = 1
+    //   w: 0 -> -1 -> -1.5 -> 0;  E: -2, -3, 0;  A: 2, 3, 6   (beta = E/A would end at w = -2)
+    for (size_t t = 0; t < net.NumTables(); ++t) {
+        std::fill(net.StageWeights(0)[t].begin(), net.StageWeights(0)[t].end(), 0.0f);
+        std::fill(E[t].begin(), E[t].end(), 0.0f);
+        std::fill(A[t].begin(), A[t].end(), 0.0f);
+    }
+    net.UpdateValueTC(b, 0, 0.5f, -2.0f, E, A);
+    net.UpdateValueTC(b, 0, 0.5f, -1.0f, E, A);
+    net.UpdateValueTC(b, 0, 0.5f, 3.0f, E, A);
+    bad = 0;
+    for (int i = 0; i < n; ++i) {
+        bad += std::fabs(net.StageWeights(0)[table[i]][index[i]]) > 1e-6f;
+        bad += E[table[i]][index[i]] != 0.0f || A[table[i]][index[i]] != 6.0f;
+    }
+    CHECK(bad == 0);
+}
+
+// TdLearner tc=1: E and A survive a save and reload (a reloaded learner learns exactly like one
+// that kept running), belong to one stage, and a non-TC save drops a stale .tc file
+static void TestTCLearner() {
+    std::string ckpt = SmallCheckpoint("sixteen-tc.ckpt", 0);
+    std::string saved = ckpt + ".saved", resumed = ckpt + ".resumed";
+    auto keep = MakeLearner("load=" + ckpt + " tc=1 alpha=0.02 save=" + saved);
+    std::vector<board_t> boards;
+    keep->Learn(PlayGame(keep, 21, &boards));
+    keep->Save();
+    std::ifstream probe(saved + ".tc");
+    CHECK(bool(probe));
+    auto reload = MakeLearner("load=" + saved + " tc=1 alpha=0.02 save=" + resumed);
+    auto fresh_tc = MakeLearner("load=" + saved + " tc=1 alpha=0.02 stage=1"); // other stage: E, A at zero
+    Episode second = PlayGame(keep, 22, &boards);
+    keep->Learn(second);
+    reload->Learn(second);
+    auto plain = MakeLearner("load=" + saved + " alpha=0.02");
+    plain->Learn(second);
+    int differ = 0, differ_plain = 0;
+    for (board_t b : boards) {
+        differ += keep->Evaluate(b, 0) != reload->Evaluate(b, 0);
+        differ_plain += keep->Evaluate(b, 0) != plain->Evaluate(b, 0);
+    }
+    CHECK(differ == 0 && differ_plain > 0);
+    CHECK(reload->TCLoaded() && !keep->TCLoaded());
+    CHECK(fresh_tc->ActiveStage() == 1 && !fresh_tc->TCLoaded()); // the .tc is for stage 0
+    // a learner without tc saving over the same path removes the .tc that no longer matches
+    auto no_tc = MakeLearner("load=" + saved + " save=" + saved);
+    no_tc->Save();
+    std::ifstream gone(saved + ".tc");
+    CHECK(!gone);
+    for (const std::string &p : {ckpt, saved, resumed, resumed + ".tc"}) std::remove(p.c_str());
+}
+
 int main() {
     InitLookUpTables();
+    TestGenericValue();
+    TestTCUpdate();
+    TestTCLearner();
     TestCosineAnnealing();
     TestOptimisticInit();
     TestDowngrade();

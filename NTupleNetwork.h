@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -10,6 +11,9 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 #include "Board64.h"
 
@@ -219,6 +223,27 @@ public:
         };
     }
 
+    // Matsuzaki's 8x6-tuple network, as drawn in Fig. 3 of arXiv:2111.11090 (cells 0..15 row by row)
+    static std::vector<std::vector<int>> Patterns8x6() {
+        return {
+                {0, 1, 2, 4, 5, 6},
+                {1, 2, 5, 6, 9, 13},
+                {0, 1, 2, 3, 4, 5},
+                {0, 1, 5, 6, 7, 10},
+                {0, 1, 2, 5, 9, 10},
+                {0, 1, 5, 9, 13, 14},
+                {0, 1, 5, 8, 9, 13},
+                {0, 1, 2, 4, 6, 10},
+        };
+    }
+
+    // "4x6" (default, [MS-TD]) or "8x6"
+    static std::vector<std::vector<int>> NamedPatterns(const std::string &name) {
+        if (name == "4x6") return DefaultPatterns();
+        if (name == "8x6") return Patterns8x6();
+        throw std::invalid_argument("unknown patterns " + name + " (4x6 or 8x6)");
+    }
+
     NTupleNetwork(int stages = kMaxStages, uint32_t features = kFeatAll,
                   const std::vector<std::vector<int>> &patterns = DefaultPatterns()) {
         Configure(patterns, stages, features);
@@ -232,13 +257,68 @@ public:
 
     int NumActiveFeatures() const { return int(patterns_.size()) * 8 + __builtin_popcount(features_); }
 
+    size_t NumTables() const { return weights_.empty() ? 0 : weights_[0].size(); }
+
+    size_t TableSize(size_t t) const {
+        if (t < patterns_.size()) return patterns_[t].TableSize();
+        // the (t - n_patterns)-th enabled scalar feature
+        int j = int(t - patterns_.size());
+        for (uint32_t bit = 1; bit <= kFeatAll; bit <<= 1) {
+            if (!(features_ & bit)) continue;
+            if (j-- == 0) return ScalarTableSize(bit);
+        }
+        throw std::logic_error("bad table index");
+    }
+
+    static constexpr int kMaxFeatures = 8 * 8 + 5; // up to 8 tuples x 8 symmetries + 5 scalar features
+
+    /**
+     * The weights a board reads, in the order GetValueReference sums them: table[k], index[k] for
+     * k < return value. Any patterns (at most 8, default ones through the mask path); used by the
+     * generic fast path and by TC learning.
+     */
+    int FeatureIndices(board_t b, uint32_t *table, size_t *index) const {
+        int n = 0;
+        if (fast_tuples_) {
+            size_t idx[4][8];
+            TupleIndices(b, idx);
+            for (int p = 0; p < 4; ++p) {
+                for (int iso = 0; iso < 8; ++iso) table[n] = p, index[n++] = idx[p][iso];
+            }
+        } else {
+            board_t img[8];
+            fast::Images(b, img);
+            const int *order = fast::Order().image;
+            for (size_t p = 0; p < patterns_.size(); ++p) {
+                const std::vector<Run> &runs = runs_[p];
+                for (int iso = 0; iso < 8; ++iso) {
+                    board_t x = img[order[iso]]; // x(cell) = b(Transform(cell, iso))
+                    size_t i = 0;
+                    for (const Run &r : runs) i |= size_t((r.right ? x >> r.shift : x << r.shift) & r.mask);
+                    table[n] = uint32_t(p), index[n++] = i;
+                }
+            }
+        }
+        if (features_) {
+            size_t sidx[5];
+            int m = ScalarIndices(b, sidx);
+            for (int j = 0; j < m; ++j) table[n] = uint32_t(patterns_.size() + j), index[n++] = sidx[j];
+        }
+        return n;
+    }
+
     bool Initialized(int stage) const { return initialized_[stage]; }
 
     // allocates a stage with every weight = value: 0 by default ([MS-TD] Sec. III: "feature weights are
     // all initialized to be zero"), or an optimistic value (arXiv:2111.11090)
     void InitStage(int stage, float value = 0.0f) {
         if (initialized_[stage]) return;
-        for (size_t t = 0; t < weights_[stage].size(); ++t) weights_[stage][t].assign(TableSize(t), value);
+        for (size_t t = 0; t < weights_[stage].size(); ++t) {
+            std::vector<float> &table = weights_[stage][t];
+            table.reserve(TableSize(t)); // allocated, not touched yet
+            AdviseHugePages(table.data(), TableSize(t) * sizeof(float));
+            table.assign(TableSize(t), value);
+        }
         initialized_[stage] = true;
     }
 
@@ -263,7 +343,7 @@ public:
     bool FastTuples() const { return fast_tuples_; }
 
     float GetValue(board_t b, int stage) const {
-        if (!fast_tuples_) return GetValueReference(b, stage);
+        if (!fast_tuples_) return GetValueGeneric(b, stage);
         const std::vector<std::vector<float>> &w = weights_[stage];
         size_t idx[4][8];
         TupleIndices(b, idx);
@@ -282,7 +362,7 @@ public:
 
     // adds delta to the weight of every occurring feature, i.e. delta = alpha * td_error
     void UpdateValue(board_t b, int stage, float delta) {
-        if (!fast_tuples_) return UpdateValueReference(b, stage, delta);
+        if (!fast_tuples_) return UpdateValueGeneric(b, stage, delta);
         std::vector<std::vector<float>> &w = weights_[stage];
         size_t idx[4][8];
         TupleIndices(b, idx);
@@ -294,6 +374,46 @@ public:
             size_t sidx[5];
             int n = ScalarIndices(b, sidx);
             for (int j = 0; j < n; ++j) AddWeight(w[4 + j][sidx[j]], delta);
+        }
+    }
+
+    // any patterns: the symmetric images of the board, read cell by cell
+    float GetValueGeneric(board_t b, int stage) const {
+        const std::vector<std::vector<float>> &w = weights_[stage];
+        uint32_t table[kMaxFeatures];
+        size_t index[kMaxFeatures];
+        int n = FeatureIndices(b, table, index);
+        float value = 0;
+        for (int k = 0; k < n; ++k) value += LoadWeight(w[table[k]][index[k]]);
+        return value;
+    }
+
+    void UpdateValueGeneric(board_t b, int stage, float delta) {
+        std::vector<std::vector<float>> &w = weights_[stage];
+        uint32_t table[kMaxFeatures];
+        size_t index[kMaxFeatures];
+        int n = FeatureIndices(b, table, index);
+        for (int k = 0; k < n; ++k) AddWeight(w[table[k]][index[k]], delta);
+    }
+
+    /**
+     * Temporal coherence learning (Jaskowski 2016; eqs. 7-9 of arXiv:2111.11090): every weight i of
+     * the board moves by alpha * beta_i * error with beta_i = |E_i| / A_i (1 while A_i = 0), then
+     * E_i += error and A_i += |error|. E and A have the shape of one stage's tables.
+     */
+    void UpdateValueTC(board_t b, int stage, float alpha, float error,
+                       std::vector<std::vector<float>> &E, std::vector<std::vector<float>> &A) {
+        std::vector<std::vector<float>> &w = weights_[stage];
+        uint32_t table[kMaxFeatures];
+        size_t index[kMaxFeatures];
+        int n = FeatureIndices(b, table, index);
+        for (int k = 0; k < n; ++k) {
+            float &e = E[table[k]][index[k]], &a = A[table[k]][index[k]];
+            float a_now = LoadWeight(a);
+            float beta = a_now != 0.0f ? std::fabs(LoadWeight(e)) / a_now : 1.0f;
+            AddWeight(w[table[k]][index[k]], alpha * beta * error);
+            AddWeight(e, error);
+            AddWeight(a, std::fabs(error));
         }
     }
 
@@ -443,7 +563,7 @@ public:
     void PrintSummary(std::ostream &out) const {
         size_t bytes = 0;
         for (size_t t = 0; t < weights_[0].size(); ++t) bytes += TableSize(t) * sizeof(float);
-        out << "network: " << patterns_.size() << " 6-tuples x 8 isomorphisms, features=0x" << std::hex << features_
+        out << "network: " << patterns_.size() << " tuples x 8 isomorphisms, features=0x" << std::hex << features_
             << std::dec << ", " << n_stages_ << " stage(s), " << (bytes >> 20) << " MB per stage, initialized:";
         for (int s = 0; s < n_stages_; ++s) out << " " << initialized_[s];
         out << std::endl;
@@ -453,8 +573,24 @@ private:
     void Configure(const std::vector<std::vector<int>> &patterns, int stages, uint32_t features) {
         if (stages < 1 || stages > kMaxStages) throw std::invalid_argument("stages must be 1 to 5");
         if (features & ~kFeatAll) throw std::invalid_argument("unknown feature flags");
+        if (patterns.size() > 8) throw std::invalid_argument("at most 8 tuples");
         patterns_.clear();
-        for (const std::vector<int> &p : patterns) patterns_.emplace_back(p);
+        runs_.clear();
+        for (const std::vector<int> &p : patterns) {
+            if (p.empty() || p.size() > 7) throw std::invalid_argument("tuples must have 1 to 7 cells");
+            patterns_.emplace_back(p);
+            // cells k..k+L-1 of the tuple that sit in consecutive board cells move as one block
+            std::vector<Run> runs;
+            for (size_t k = 0; k < p.size();) {
+                size_t len = 1;
+                while (k + len < p.size() && p[k + len] == p[k] + int(len)) ++len;
+                int from = 4 * p[k], to = 4 * int(k);
+                board_t mask = ((board_t(1) << (4 * len)) - 1) << to;
+                runs.push_back({from >= to, from >= to ? from - to : to - from, mask});
+                k += len;
+            }
+            runs_.push_back(runs);
+        }
         fast_tuples_ = patterns == DefaultPatterns();
         n_stages_ = stages;
         features_ = features;
@@ -490,15 +626,17 @@ private:
         return init;
     }
 
-    size_t TableSize(size_t t) const {
-        if (t < patterns_.size()) return patterns_[t].TableSize();
-        // the (t - n_patterns)-th enabled scalar feature
-        int j = int(t - patterns_.size());
-        for (uint32_t bit = 1; bit <= kFeatAll; bit <<= 1) {
-            if (!(features_ & bit)) continue;
-            if (j-- == 0) return ScalarTableSize(bit);
-        }
-        throw std::logic_error("bad table index");
+    // Ask for 2 MB pages on a big table before its first touch: lookups are random, and with 4 KB
+    // pages almost every one also misses the TLB. Only a hint; no effect where THP is off.
+    static void AdviseHugePages(void *data, size_t bytes) {
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        const uintptr_t huge = uintptr_t(2) << 20;
+        if (bytes < 2 * huge) return;
+        uintptr_t begin = (uintptr_t(data) + huge - 1) & ~(huge - 1), end = (uintptr_t(data) + bytes) & ~(huge - 1);
+        if (end > begin) madvise(reinterpret_cast<void *>(begin), end - begin, MADV_HUGEPAGE);
+#else
+        (void) data, (void) bytes;
+#endif
     }
 
     static size_t ScalarTableSize(uint32_t bit) {
@@ -562,7 +700,14 @@ private:
         return v;
     }
 
+    struct Run {
+        bool right;     // shift direction
+        int shift;      // bits
+        board_t mask;   // the run's nibbles at their place in the index
+    };
+
     std::vector<Pattern> patterns_;
+    std::vector<std::vector<Run>> runs_; // per pattern, for the generic fast path
     int n_stages_ = 1;
     uint32_t features_ = 0;
     bool fast_tuples_ = false;
