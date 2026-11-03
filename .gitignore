@@ -8,3 +8,4 @@ arena-link-*
 *.log
 kaggle/runs/
 .remember/
+.claude.local.md
