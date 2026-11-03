@@ -3,7 +3,9 @@
 # next one. Meant to run every 30 minutes from GitHub Actions (.github/workflows/chain.yml), but works
 # from any shell with the kaggle CLI logged in.
 #
-# usage: kaggle/chain.sh <kaggle-username>
+# usage: [EXP=name] kaggle/chain.sh <kaggle-username>
+#   EXP: chain the experiment kernel sixteen-<EXP> (state in chain-state-<EXP>, see push.sh);
+#        unset = the main run, sixteen-train
 #
 #   RUNNING / QUEUED   nothing to do
 #   COMPLETE           download the output, check that the checkpoint loads and that training moved
@@ -23,14 +25,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 user="${1:?usage: kaggle/chain.sh <kaggle-username>}"
-slug="$user/sixteen-train"
+exp="${EXP:-}"
+slug="$user/sixteen-${exp:-train}"
 KAGGLE="${KAGGLE:-kaggle}"
 PUSH="${PUSH:-kaggle/push.sh}"
 NOW="${NOW:-$(date +%s)}"
 dir="${CHAIN_DIR:-kaggle}"
-state="$dir/chain-state"
-history="$dir/chain-history"
-out="$dir/runs/latest"
+state="$dir/chain-state${exp:+-$exp}"
+history="$dir/chain-history${exp:+-$exp}"
+out="$dir/runs/${exp:-latest}"
 stall_hours=13 # a pushed session runs at most 12h; equal progress after this long means it made none
 
 # ---- state: last_games, last_boards, pushed_at, pushes, halted
@@ -116,7 +119,7 @@ if [ "$games" -eq "$last_games" ] && [ "$boards" -le "$last_boards" ]; then
 fi
 
 # ---- push the next session; it must find at least these games
-MIN_GAMES="$games" $PUSH "$user" 11 || halt "push failed"
+EXP="$exp" MIN_GAMES="$games" $PUSH "$user" 11 || halt "push failed"
 last_games=$games last_boards=$boards pushed_at=$NOW pushes=$((pushes + 1))
 save_state
 note "PUSH #$pushes: from games=$games ($games_list) boards=$boards"

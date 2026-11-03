@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build the Kaggle kernel (sources embedded in train.py) and push it, which starts a run.
 #
-# usage: [MIN_GAMES=n] kaggle/push.sh <kaggle-username> [hours]
+# usage: [EXP=name] [MIN_GAMES=n] kaggle/push.sh <kaggle-username> [hours]
+#   EXP: experiment (kernel sixteen-<EXP> with its own config, see below); unset = the main run,
+#        kernel sixteen-train
 #   hours: budget per session, default 11 (Kaggle CPU sessions stop at 12h)
 #   MIN_GAMES: the session refuses to train unless it finds a checkpoint with at least this many
 #              games in total (kaggle/chain.sh sets it), so a broken chain never restarts from scratch
@@ -18,8 +20,9 @@ cd "$(dirname "$0")/.."
 
 user="${1:?usage: kaggle/push.sh <kaggle-username> [hours]}"
 hours="${2:-11}"
-slug="sixteen-train"
-out="kaggle/build"
+exp="${EXP:-}"
+slug="sixteen-${exp:-train}"
+out="kaggle/build${exp:+-$exp}"
 
 mkdir -p "$out"
 sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
@@ -29,6 +32,21 @@ sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
 anneal="['step', 'cos', 'cos', 'cos', 'cos']"
 init="[0, 0, 0, 0, 0]"
 config="{'stages': 5, 'lambda': 0.5, 'games_per_stage': 10000000, 'decay_at': 5000000, 'collect': 100000, 'hours': $hours, 'margin_minutes': 20, 'threads': None, 'block': 10000, 'save_every': 200000, 'min_games': ${MIN_GAMES:-0}, 'anneal': $anneal, 'alpha_min': 0.000025, 'init': $init}"
+
+# Experiments: the main config with some keys replaced.
+# x3a / x3b: arXiv:2111.11090's best design, OTD+TC on the 8x6-tuple network with 2 stages (split
+# at 16384) and V_init = 320k, plus our scalar features: TD for 90% of each stage's games, then TC.
+# alpha is per state in the paper (0.1 for TD, 1.0 for TC), spread over the 69 weights a board
+# reads (8 tuples x 8 symmetries + 5 scalar features). x3a keeps the TD alpha fixed (the paper);
+# x3b anneals it with a cosine down to 0.01 per state.
+case "$exp" in
+  "") override="{}" ;;
+  x3a|x3b)
+    schedule=$([ "$exp" = x3a ] && echo tdtc || echo costc)
+    override="{'stages': 2, 'patterns': '8x6', 'anneal': ['$schedule', '$schedule'], 'init': [320000, 320000], 'tc_fraction': 0.1, 'alpha_td': $(python3 -c 'print(0.1 / 69)'), 'alpha_td_min': $(python3 -c 'print(0.01 / 69)'), 'alpha_tc': $(python3 -c 'print(1.0 / 69)')}" ;;
+  *) echo "unknown EXP=$exp" >&2; exit 1 ;;
+esac
+config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
 
 python3 - "$sources" "$config" > "$out/train.py" <<'EOF'
 import sys

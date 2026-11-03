@@ -5,7 +5,11 @@
 #                     then start stage k+1 (all weights at init[k+1]/features: 0 = [MS-TD]'s zero init,
 #                     > 0 = optimistic init, arXiv:2111.11090).
 #   alpha per stage (anneal[k]): 'step' = [MS-TD] 0.0025, then 0.00025 after decay_at games;
-#                                'cos'  = cosine from 0.0025 down to alpha_min over games_per_stage.
+#                                'cos'  = cosine from 0.0025 down to alpha_min over games_per_stage;
+#                                'tdtc' = TD at alpha_td, then TC (alpha_tc) for the last tc_fraction
+#                                         of the games (OTD+TC of arXiv:2111.11090);
+#                                'costc' = the same, with the TD phase annealed by a cosine from
+#                                         alpha_td down to alpha_td_min.
 # A stage's schedule and init can be changed for stages that have not started yet; changing them for
 # the stage in progress mixes schedules (allowed, but the cosine then starts mid-curve).
 # Every step resumes: the checkpoint and board files are read from /kaggle/input (the previous
@@ -103,7 +107,16 @@ def stage_setting(key, k, default):
 
 def train_args(k, games):
     """(games to train, --play args for alpha) for stage k that has `games` games so far"""
-    if stage_setting("anneal", k, "step") == "cos":
+    schedule = stage_setting("anneal", k, "step")
+    if schedule in ("tdtc", "costc"):
+        switch = int(CONFIG["games_per_stage"] * (1 - CONFIG["tc_fraction"]))
+        if games >= switch:
+            return CONFIG["games_per_stage"] - games, f"alpha={CONFIG['alpha_tc']} tc=1"
+        if schedule == "tdtc":
+            return switch - games, f"alpha={CONFIG['alpha_td']}"
+        return (switch - games, f"alpha={CONFIG['alpha_td']} anneal=cos anneal_games={switch} "
+                                f"alpha_min={CONFIG['alpha_td_min']}")
+    if schedule == "cos":
         return (CONFIG["games_per_stage"] - games,
                 f"alpha=0.0025 anneal=cos anneal_games={CONFIG['games_per_stage']} alpha_min={CONFIG['alpha_min']}")
     # [MS-TD] Sec. IV.E (b): alpha 0.0025 until saturated, then 0.00025
@@ -122,8 +135,8 @@ def main():
         if ckpt is None:
             total, alpha = train_args(0, 0)
             run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}",
-                 f"--play=save={CKPT} stages={CONFIG['stages']} {alpha} lambda={CONFIG['lambda']} "
-                 f"init={stage_setting('init', 0, 0)}"])
+                 f"--play=save={CKPT} stages={CONFIG['stages']} patterns={CONFIG.get('patterns', '4x6')} "
+                 f"{alpha} lambda={CONFIG['lambda']} init={stage_setting('init', 0, 0)}"])
             ckpt = CKPT
             continue
 
@@ -157,6 +170,8 @@ def main():
     # the output must always hold the latest checkpoint, even if this session only collected boards
     if ckpt and os.path.abspath(ckpt) != os.path.abspath(CKPT):
         shutil.copy(ckpt, CKPT)
+        if os.path.exists(ckpt + ".tc"):  # TC state belongs with its checkpoint
+            shutil.copy(ckpt + ".tc", CKPT + ".tc")
     if os.path.exists(CKPT):
         log(f"final: {info(CKPT)}")
 

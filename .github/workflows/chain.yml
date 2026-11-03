@@ -2,6 +2,9 @@
 # session has finished, kaggle/chain.sh verifies its checkpoint and pushes the next session.
 # The pushed session embeds the sources of this branch, so code changes take effect once pushed here.
 #
+# One matrix entry per chain: main (kernel sixteen-train) and the experiments (sixteen-<exp>,
+# configs in kaggle/push.sh). They run one after another; each has its own state file.
+#
 # Needs the repository secret KAGGLE_API_TOKEN (the KGAT_... token from ~/.kaggle/access_token).
 # When the chain halts or finishes, this opens an issue (and a halted run fails, which also emails).
 name: chain kaggle sessions
@@ -23,6 +26,14 @@ jobs:
   chain:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        exp: [main, x3a, x3b]
+    env:
+      EXP: ${{ matrix.exp != 'main' && matrix.exp || '' }}
+      RUNS: ${{ matrix.exp != 'main' && matrix.exp || 'latest' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -42,21 +53,23 @@ jobs:
       - name: Save chain state
         if: always()
         run: |
-          git add kaggle/chain-state kaggle/chain-history 2>/dev/null || true
+          git add kaggle/chain-state* kaggle/chain-history* 2>/dev/null || true
           if ! git diff --cached --quiet; then
             git -c user.name="github-actions[bot]" \
                 -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-                commit -m "chain: update state"
-            git pull --rebase --quiet
-            git push
+                commit -m "chain: update state (${{ matrix.exp }})"
+            for attempt in 1 2 3; do
+              git pull --rebase --quiet && git push && break
+              sleep 5
+            done
           fi
 
       - name: Keep the session log
-        if: always() && hashFiles('kaggle/runs/latest/train.log') != ''
+        if: always() && hashFiles(format('kaggle/runs/{0}/train.log', env.RUNS)) != ''
         uses: actions/upload-artifact@v4
         with:
-          name: train-log-${{ github.run_id }}
-          path: kaggle/runs/latest/train.log
+          name: train-log-${{ matrix.exp }}-${{ github.run_id }}
+          path: kaggle/runs/${{ env.RUNS }}/train.log
           retention-days: 14
 
       - name: Open an issue when the chain stops
@@ -67,11 +80,12 @@ jobs:
           DONE: ${{ steps.chain.outputs.done }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
+          state="kaggle/chain-state${EXP:+-$EXP}"
           if [ "$DONE" = 1 ]; then
-            title="Kaggle training finished: all stages trained"
+            title="Kaggle training finished (${{ matrix.exp }}): all stages trained"
             body="The chain stopped because every stage is trained. Run: $RUN_URL"
           else
-            title="Kaggle chain halted"
-            body=$(printf 'Reason: %s\n\nNothing was pushed. Fix the cause, then clear `halted=` in kaggle/chain-state and push.\n\nRun: %s' "$REASON" "$RUN_URL")
+            title="Kaggle chain halted (${{ matrix.exp }})"
+            body=$(printf 'Reason: %s\n\nNothing was pushed. Fix the cause, then clear `halted=` in %s and push.\n\nRun: %s' "$REASON" "$state" "$RUN_URL")
           fi
           gh issue create --title "$title" --body "$body"

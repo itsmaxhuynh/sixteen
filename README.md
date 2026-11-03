@@ -105,6 +105,15 @@ checkpoint and board files of its previous version's output. Push again to conti
 over `games_per_stage`) and the starting value `init` (0 = zero init); change them only for stages
 that have not started.
 
+Experiments run as separate kernels and chains next to the main one (Kaggle runs several CPU
+sessions at once): `EXP=x3a kaggle/push.sh <user>` pushes kernel `sixteen-x3a` with the main config
+plus the overrides in `push.sh`, and `EXP=x3a kaggle/chain.sh <user>` chains it (state in
+`kaggle/chain-state-x3a`). x3a and x3b follow the best design of arXiv:2111.11090: 2 stages (split at
+16384) of Matsuzaki's 8x6-tuple network (`patterns=8x6`) plus our scalar features, every weight
+optimistically initialized so boards start at 320k, TD for 90% of each stage's games and TC
+(`tc=1`) for the last 10%. x3a keeps the TD alpha fixed (0.1 per state, the paper); x3b anneals it
+with a cosine to 0.01. 8x6 costs about 2.8x the time per move of 4x6 and 516 MB per stage.
+
 ## Design notes
 
 * Board: `uint64_t`, 4 bits per cell holding the rank (tile = 2^rank), row r at bits 16r.
