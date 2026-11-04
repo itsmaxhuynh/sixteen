@@ -145,9 +145,10 @@ public:
     explicit Reporter(size_t block) : block_(block), start_(Clock::now()), block_start_(start_) {}
 
     void Add(const Episode &game) {
+        int split = MaxSplit(game);
         std::lock_guard<std::mutex> lock(mutex_);
-        Accumulate(block_acc_, game);
-        Accumulate(total_acc_, game);
+        Accumulate(block_acc_, game, split);
+        Accumulate(total_acc_, game, split);
         if (block_acc_.games == block_) {
             auto now = Clock::now();
             Print(block_acc_, total_acc_.games, std::chrono::duration<double>(now - block_start_).count());
@@ -209,9 +210,22 @@ private:
         double max = 0;
         size_t moves = 0;
         size_t end_tile[16] = {0};
+        size_t split[5] = {0}; // games whose highest split reached ([MS-TD] T_16k, T_16+8k, ...) was k
     };
 
-    static void Accumulate(Acc &acc, const Episode &game) {
+    // Highest split the game reached at any point: the max tile alone says nothing in later stages,
+    // whose games all start from boards that already hold 16384.
+    static int MaxSplit(const Episode &game) {
+        int k = SplitLevel(game.StartBoard(), 4);
+        for (const Episode::Move &m : game.GetMoves()) {
+            if (k == 4) break;
+            k = std::max(k, SplitLevel(m.board, 4));
+        }
+        return k;
+    }
+
+    static void Accumulate(Acc &acc, const Episode &game, int split) {
+        acc.split[split]++;
         acc.games++;
         acc.score += game.score();
         acc.score_sq += double(game.score()) * double(game.score());
@@ -234,6 +248,17 @@ private:
             out << std::setprecision(2) << "\t" << (t ? (1 << t) : 0) << "\t" << reached * 100.0 / acc.games << "%\t("
                 << acc.end_tile[t] * 100.0 / acc.games << "%)" << std::endl;
             reached -= acc.end_tile[t];
+        }
+        // reach rates of the stage splits, printed once some game got to 16384
+        static const char *names[5] = {"", "16k", "16+8k", "16+8+4k", "16+8+4+2k"};
+        if (acc.games > acc.split[0]) {
+            out << "\tsplits";
+            size_t at_least = acc.games - acc.split[0];
+            for (int k = 1; k <= 4; ++k) {
+                out << std::setprecision(2) << "\t" << names[k] << " " << at_least * 100.0 / acc.games << "%";
+                at_least -= acc.split[k];
+            }
+            out << std::endl;
         }
         std::cout << out.str() << std::endl;
     }
