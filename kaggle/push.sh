@@ -52,6 +52,10 @@ case "$exp" in
   # up to 500 slides before the end of a game; x4b also doubles a tile of 30% of the start boards.
   x4a) override="{'stage_games': [12000000], 'hard': 0.5, 'hard_rewind': 500}" ;;
   x4b) override="{'stage_games': [12000000], 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
+  # x5: the main method (5 stages, TD(0.5), step then cosine alpha, zero init) on the 8x6-tuple
+  # network, trained from scratch with hard starts and tile-upgrading as in x4b, 10M games per stage
+  # like main. 8x6 runs at about a third of 4x6's moves/s, so this is the slowest chain.
+  x5) override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")

@@ -123,6 +123,10 @@ below the stage's next split tile is doubled, e.g. 4096 -> 8192 in stage 0, so g
 hard part of the stage more often. Both first give stage 0 2M more games (`stage_games`), then
 carry on with stage 1. Progress lines count normal starts only, so they compare with main's.
 
+x5 trains the main method (5 stages, TD(0.5), zero init) on the 8x6-tuple network from scratch, with
+x4b's hard starts and tile-upgrading, 10M games per stage like main. 8x6 runs at about a third of
+4x6's speed, so it is the slowest chain.
+
 ## Design notes
 
 * Board: `uint64_t`, 4 bits per cell holding the rank (tile = 2^rank), row r at bits 16r.

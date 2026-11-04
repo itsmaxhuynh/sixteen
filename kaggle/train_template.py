@@ -153,8 +153,9 @@ def main():
     while remaining() > 60:
         if ckpt is None:
             total, alpha = train_args(0, 0)
-            run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}",
-                 f"--play=save={CKPT} stages={CONFIG['stages']} patterns={CONFIG.get('patterns', '4x6')} "
+            run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}"] +
+                hard_args(0, CONFIG["stages"]) +
+                [f"--play=save={CKPT} stages={CONFIG['stages']} patterns={CONFIG.get('patterns', '4x6')} "
                  f"{alpha} lambda={CONFIG['lambda']} init={stage_setting('init', 0, 0)}"])
             ckpt = CKPT
             continue
