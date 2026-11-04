@@ -5,6 +5,8 @@
 #   EXP: experiment (kernel sixteen-<EXP> with its own config, see below); unset = the main run,
 #        kernel sixteen-train
 #   hours: budget per session, default 11 (Kaggle CPU sessions stop at 12h)
+#   SEED: an extra kernel to resume from on the first push of an experiment (e.g. sixteen-train, to
+#         start from the main run's checkpoint); later pushes list only the kernel itself
 #   MIN_GAMES: the session refuses to train unless it finds a checkpoint with at least this many
 #              games in total (kaggle/chain.sh sets it), so a broken chain never restarts from scratch
 #
@@ -44,6 +46,12 @@ case "$exp" in
   x3a|x3b)
     schedule=$([ "$exp" = x3a ] && echo tdtc || echo costc)
     override="{'stages': 2, 'patterns': '8x6', 'anneal': ['$schedule', '$schedule'], 'init': [320000, 320000], 'tc_fraction': 0.1, 'alpha_td': $(python3 -c 'print(0.1 / 69)'), 'alpha_td_min': $(python3 -c 'print(0.01 / 69)'), 'alpha_tc': $(python3 -c 'print(1.0 / 69)')}" ;;
+  # x4a / x4b: hard starts (HardStarts.h) on top of the main run, from its checkpoint (first push with
+  # SEED=sixteen-train MIN_GAMES=<its games>). Stage 0 gets 2M more games at its final alpha, then the
+  # driver carries on with stage 1 and the rest as in main. Half the games start from boards rewound
+  # up to 500 slides before the end of a game; x4b also doubles a tile of 30% of the start boards.
+  x4a) override="{'stage_games': [12000000], 'hard': 0.5, 'hard_rewind': 500}" ;;
+  x4b) override="{'stage_games': [12000000], 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
@@ -60,6 +68,9 @@ if kaggle kernels status "$user/$slug" > /dev/null 2>&1; then
 else
   echo "first push of $user/$slug: no previous output to resume from"
   self_source=""
+fi
+if [ -n "${SEED:-}" ]; then
+  self_source="${self_source:+$self_source, }\"$user/$SEED\""
 fi
 
 cat > "$out/kernel-metadata.json" <<EOF

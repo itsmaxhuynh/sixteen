@@ -10,6 +10,12 @@
 #                                         of the games (OTD+TC of arXiv:2111.11090);
 #                                'costc' = the same, with the TD phase annealed by a cosine from
 #                                         alpha_td down to alpha_td_min.
+# stage_games[k] (default games_per_stage) is stage k's game target. Raising it for a stage that is
+# already done makes the driver go back and train that stage further (e.g. fine-tune stage 0) before it
+# carries on with the active stage; the later stages keep their weights.
+# Hard starts (HardStarts.h, all stages): 'hard' = share of games started from boards rewound
+# 'hard_rewind' slides before the end of earlier games, 'upgrade' = chance a start board gets a tile
+# doubled (not in the last stage). Off when absent.
 # A stage's schedule and init can be changed for stages that have not started yet; changing them for
 # the stage in progress mixes schedules (allowed, but the cosine then starts mid-curve).
 # Every step resumes: the checkpoint and board files are read from /kaggle/input (the previous
@@ -105,23 +111,36 @@ def stage_setting(key, k, default):
     return values[k] if values and k < len(values) else default
 
 
+def target(k):
+    return stage_setting("stage_games", k, CONFIG["games_per_stage"])
+
+
+def hard_args(k, stages):
+    args = []
+    if CONFIG.get("hard"):
+        args += [f"--hard={CONFIG['hard']}", f"--hard-rewind={CONFIG.get('hard_rewind', 500)}"]
+    if CONFIG.get("upgrade") and k + 1 < stages:
+        args += [f"--upgrade={CONFIG['upgrade']}"]
+    return args
+
+
 def train_args(k, games):
     """(games to train, --play args for alpha) for stage k that has `games` games so far"""
     schedule = stage_setting("anneal", k, "step")
     if schedule in ("tdtc", "costc"):
-        switch = int(CONFIG["games_per_stage"] * (1 - CONFIG["tc_fraction"]))
+        switch = int(target(k) * (1 - CONFIG["tc_fraction"]))
         if games >= switch:
-            return CONFIG["games_per_stage"] - games, f"alpha={CONFIG['alpha_tc']} tc=1"
+            return target(k) - games, f"alpha={CONFIG['alpha_tc']} tc=1"
         if schedule == "tdtc":
             return switch - games, f"alpha={CONFIG['alpha_td']}"
         return (switch - games, f"alpha={CONFIG['alpha_td']} anneal=cos anneal_games={switch} "
                                 f"alpha_min={CONFIG['alpha_td_min']}")
     if schedule == "cos":
-        return (CONFIG["games_per_stage"] - games,
+        return (target(k) - games,
                 f"alpha=0.0025 anneal=cos anneal_games={CONFIG['games_per_stage']} alpha_min={CONFIG['alpha_min']}")
     # [MS-TD] Sec. IV.E (b): alpha 0.0025 until saturated, then 0.00025
     decayed = games >= CONFIG["decay_at"]
-    return ((CONFIG["games_per_stage"] if decayed else CONFIG["decay_at"]) - games,
+    return ((target(k) if decayed else CONFIG["decay_at"]) - games,
             f"alpha={0.00025 if decayed else 0.0025}")
 
 
@@ -141,14 +160,20 @@ def main():
             continue
 
         meta = info(ckpt)
-        k, games = meta["active"], meta["games"][meta["active"]]
+        k = meta["active"]
+        # an earlier stage whose target was raised is trained first (it becomes the active stage)
+        behind = [s for s in range(k) if meta["games"][s] < target(s)]
+        if behind:
+            k = behind[0]
+        games = meta["games"][k]
         start = [f"--start={boards_path(k)}"] if k > 0 else []
 
-        if games < CONFIG["games_per_stage"]:
+        if games < target(k):
             total, alpha = train_args(k, games)
             log(f"stage {k}: {games} games, training {total} more with {alpha}")
             run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}"] + start +
-                [f"--play=load={ckpt} save={CKPT} {alpha} lambda={CONFIG['lambda']}"])
+                hard_args(k, meta["stages"]) +
+                [f"--play=load={ckpt} save={CKPT} stage={k} {alpha} lambda={CONFIG['lambda']}"])
             ckpt = CKPT
         elif k + 1 < meta["stages"]:
             nxt = boards_path(k + 1)

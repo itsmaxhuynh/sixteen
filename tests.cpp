@@ -8,6 +8,7 @@
 #include <set>
 
 #include "Agent.h"
+#include "HardStarts.h"
 #include "Board64.h"
 #include "NTupleNetwork.h"
 
@@ -809,6 +810,58 @@ static void TestTCLearner() {
     for (const std::string &p : {ckpt, saved, resumed, resumed + ".tc"}) std::remove(p.c_str());
 }
 
+static void TestUpgradeTile() {
+    // stage 0 (next split needs 16384): the largest tile below 8192 is doubled
+    CHECK(UpgradeTile(MakeBoard({12, 11, 3}).GetBoard(), 0) == MakeBoard({13, 11, 3}).GetBoard());
+    CHECK(UpgradeTile(MakeBoard({13, 12, 5}).GetBoard(), 0) == MakeBoard({13, 13, 5}).GetBoard());
+    CHECK(UpgradeTile(MakeBoard({13, 2}).GetBoard(), 0) == MakeBoard({13, 3}).GetBoard()); // never makes 16384
+    CHECK(UpgradeTile(MakeBoard({13}).GetBoard(), 0) == MakeBoard({13}).GetBoard());
+    // stage 1 (16384 present, next split needs 8192): 16384 stays, tiles up to 2048 are doubled
+    CHECK(UpgradeTile(MakeBoard({14, 12, 11}).GetBoard(), 1) == MakeBoard({14, 12, 12}).GetBoard());
+    CHECK(UpgradeTile(MakeBoard({14, 12}).GetBoard(), 1) == MakeBoard({14, 12}).GetBoard());
+    CHECK(UpgradeTile(0, 0) == 0);
+}
+
+static void TestHardStarts() {
+    auto learner = MakeLearner("stages=2");
+    std::vector<board_t> boards;
+    Episode game = PlayGame(learner, 5, &boards); // an untrained player dies long before 16384
+    const auto &moves = game.GetMoves();
+    size_t first = game.FirstSlide();
+    size_t slides = (moves.size() - first + 1) / 2;
+    auto split = [&](board_t b) { return learner->Split(b); };
+    std::mt19937_64 rng(1);
+
+    // rewind 1: the board right before the last slide, with the score made up to that point
+    HardStarts pool(10, 1);
+    pool.Offer(game, 0, split, rng);
+    StartPosition p;
+    CHECK(pool.Offered() == 1 && pool.Sample(rng, p));
+    size_t idx = first + 2 * (slides - 1) - 1;
+    CHECK(p.board == moves[idx].board);
+    CHECK(moves[idx].code.type() != Action::Slide::type_ && moves[idx + 1].code.type() == Action::Slide::type_);
+    reward_t score = 0;
+    for (size_t i = 0; i <= idx; ++i) score += moves[i].reward;
+    CHECK(p.score == float(score));
+    Board64 next(p.board);
+    CHECK(next.Slide(moves[idx + 1].code.event()) == moves[idx + 1].reward); // the game's own move replays
+
+    // boards outside the active stage's region are not kept, and rewinds past the start are skipped
+    HardStarts other(10, 1);
+    other.Offer(game, 1, split, rng);
+    CHECK(other.Offered() == 0 && !other.Sample(rng, p));
+    HardStarts deep(10, unsigned(2 * slides)); // about half the rewinds land before the start
+    for (int i = 0; i < 200; ++i) deep.Offer(game, 0, split, rng);
+    CHECK(deep.Offered() > 0 && deep.Offered() < 200);
+
+    // a full pool keeps the newest boards
+    HardStarts ring(1, 1);
+    Episode game2 = PlayGame(learner, 6, &boards);
+    ring.Offer(game, 0, split, rng);
+    ring.Offer(game2, 0, split, rng);
+    CHECK(ring.Sample(rng, p) && p.board != moves[idx].board);
+}
+
 int main() {
     InitLookUpTables();
     TestGenericValue();
@@ -829,6 +882,8 @@ int main() {
     TestScalarFeatures();
     TestLambdaReturn();
     TestCheckpoint();
+    TestUpgradeTile();
+    TestHardStarts();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

@@ -5,6 +5,9 @@
  *   ./sixteen --learn --play="save=w.ckpt"                                  train stage 0 from scratch
  *   ./sixteen --collect=b1.bin --play="load=w.ckpt"                         boards at the next split
  *   ./sixteen --learn --start=b1.bin --play="load=w.ckpt save=w.ckpt stage=1"
+ *   hard starts (--learn): --hard=P starts a share P of games from boards rewound 1..--hard-rewind=N
+ *   (500) slides before the end of earlier games, kept while still in the active stage (pool of
+ *   --hard-pool=N, 100000); --upgrade=Q doubles a tile of a start board with probability Q (HardStarts.h)
  *   common: --threads=N --total=N --block=N --save-every=N --time-limit=SEC --collect-count=N --summary
  * Evaluate:  ./sixteen --total=1000 --seed=1 --summary --play="load=w.ckpt ply=3"
  *   --seed=N: game i uses environment seed N+i, so every checkpoint plays the same games whatever
@@ -36,6 +39,7 @@
 #include "Agent.h"
 #include "Board64.h"
 #include "Episode.h"
+#include "HardStarts.h"
 #include "StartPositions.h"
 #include "arena.h"
 #include "io.h"
@@ -298,6 +302,9 @@ int run(int argc, const char *argv[]) {
     bool seeded = false;
     unsigned seed = 0;
     double move_limit_ms = 100;
+    double hard = 0, upgrade = 0;
+    unsigned hard_rewind = 500;
+    size_t hard_pool = 100000;
 
     std::string play_args;
     std::string evil_args;
@@ -336,6 +343,14 @@ int run(int argc, const char *argv[]) {
             seed = unsigned(std::stoul(value));
         } else if (para.find("--move-limit-ms=") == 0) {
             move_limit_ms = std::stod(value);
+        } else if (para.find("--hard=") == 0) {
+            hard = std::stod(value);
+        } else if (para.find("--hard-rewind=") == 0) {
+            hard_rewind = unsigned(std::stoul(value));
+        } else if (para.find("--hard-pool=") == 0) {
+            hard_pool = std::stoull(value);
+        } else if (para.find("--upgrade=") == 0) {
+            upgrade = std::stod(value);
         } else if (para.find("--summary") == 0) {
             summary = true;
         } else if (para.find("--shell") == 0) {
@@ -346,6 +361,9 @@ int run(int argc, const char *argv[]) {
     }
     if (learning && collect_path.size()) throw std::invalid_argument("--learn and --collect are separate phases");
     if (threads < 1) throw std::invalid_argument("--threads must be >= 1");
+    if ((hard > 0 || upgrade > 0) && !learning) throw std::invalid_argument("--hard and --upgrade are for --learn");
+    if (hard < 0 || hard > 1 || upgrade < 0 || upgrade > 1) throw std::invalid_argument("--hard and --upgrade are probabilities");
+    if (hard > 0 && (hard_rewind < 1 || hard_pool < 1)) throw std::invalid_argument("--hard-rewind and --hard-pool must be >= 1");
     if (!block) block = total;
 
     // one shared learner (Hogwild), one player and environment per thread
@@ -394,6 +412,13 @@ int run(int argc, const char *argv[]) {
     std::atomic<bool> out_of_time{false};
     auto should_stop = [&]() { return stop_requested || out_of_time.load() || collection_done(); };
 
+    if (upgrade > 0 && active + 1 >= learner->NumStages())
+        throw std::invalid_argument("--upgrade needs a next split: the active stage is the last one");
+    HardStarts hard_starts(hard_pool, hard_rewind);
+    if (hard > 0 || upgrade > 0)
+        std::cerr << "hard starts: " << hard << " of games, rewind 1.." << hard_rewind << ", pool " << hard_pool
+                  << ", upgrade " << upgrade << " (progress lines count normal starts only)" << std::endl;
+
     Reporter reporter(block);
     const uint64_t round_robin_base = learner->ActiveGames();
     std::atomic<uint64_t> claimed{0}; // games handed out in this run
@@ -421,6 +446,9 @@ int run(int argc, const char *argv[]) {
         }
         RandomEnvironment evil(evil_seeded);
         std::mt19937_64 start_rng(std::random_device{}() + id);
+        std::mt19937_64 hard_rng(std::random_device{}() + 7919u * id); // own stream: hard=0 changes nothing
+        std::uniform_real_distribution<double> coin(0, 1);
+        auto split = [&](board_t b) { return learner->Split(b); };
 
         uint64_t n;
         while (!should_stop() && claim(limit, n)) {
@@ -429,9 +457,21 @@ int run(int argc, const char *argv[]) {
                 evil.Seed(seed + unsigned(n));
                 start_rng.seed(seed + n);
             }
-            if (!starts.empty()) {
+            bool special = false; // hard or upgraded start: kept out of the progress lines and the pool
+            StartPosition hp;
+            if (hard > 0 && coin(hard_rng) < hard && hard_starts.Sample(hard_rng, hp)) {
+                game.Start(hp.board, hp.score);
+                special = true;
+            } else if (!starts.empty()) {
                 size_t i = learning ? size_t((round_robin_base + n) % starts.size()) : size_t(start_rng() % starts.size());
                 game.Start(starts[i].board, starts[i].score);
+            }
+            if (upgrade > 0 && game.FirstSlide() == 0 && coin(hard_rng) < upgrade) {
+                board_t up = UpgradeTile(game.StartBoard(), active);
+                if (up != game.StartBoard()) {
+                    game.Start(up, game.score());
+                    special = true;
+                }
             }
             player.OpenEpisode();
             evil.OpenEpisode();
@@ -461,7 +501,8 @@ int run(int argc, const char *argv[]) {
 
             if (learning) learner->Learn(game);
             if (!learning) reporter.AddMoveTimes(move_time, move_time_max, over_limit, player.TakeMoveStats());
-            reporter.Add(game);
+            if (!special) reporter.Add(game);
+            if (hard > 0 && !special) hard_starts.Offer(game, active, split, hard_rng);
 
             if (time_limit > 0) {
                 std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start_time;
@@ -485,6 +526,7 @@ int run(int argc, const char *argv[]) {
     if (stop_requested) std::cerr << "stop requested after " << claimed.load() << " games" << std::endl;
     if (out_of_time) std::cerr << "time limit reached after " << claimed.load() << " games" << std::endl;
     if (collector) std::cerr << "collected " << collector->count() << " boards" << std::endl;
+    if (hard > 0) std::cerr << "hard starts: " << hard_starts.Offered() << " boards offered to the pool" << std::endl;
 
     if (learning) learner->Save();
     if (summary) reporter.Summary(move_limit_ms);

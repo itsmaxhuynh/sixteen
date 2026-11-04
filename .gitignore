@@ -3,6 +3,7 @@ tests
 *.ckpt
 *.ckpt.tmp
 kaggle/build/
+kaggle/build-*/
 weights/
 arena-link-*
 *.log

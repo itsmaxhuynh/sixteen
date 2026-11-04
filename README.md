@@ -114,6 +114,15 @@ optimistically initialized so boards start at 320k, TD for 90% of each stage's g
 (`tc=1`) for the last 10%. x3a keeps the TD alpha fixed (0.1 per state, the paper); x3b anneals it
 with a cosine to 0.01. 8x6 costs about 2.8x the time per move of 4x6 and 516 MB per stage.
 
+x4a and x4b test hard starts (`HardStarts.h`, our own idea) on the main run, starting from its
+checkpoint (first push: `SEED=sixteen-train MIN_GAMES=<its games> EXP=x4a kaggle/push.sh <user>`).
+When a game ends, it is rewound 1..500 slides and that board is kept if it still lies in the active
+stage's region (for stage 0: before 16384); half of the training games then start from a kept board
+(`--hard=0.5`). x4b also upgrades 30% of the start boards (`--upgrade=0.3`): the largest tile
+below the stage's next split tile is doubled, e.g. 4096 -> 8192 in stage 0, so games practise the
+hard part of the stage more often. Both first give stage 0 2M more games (`stage_games`), then
+carry on with stage 1. Progress lines count normal starts only, so they compare with main's.
+
 ## Design notes
 
 * Board: `uint64_t`, 4 bits per cell holding the rank (tile = 2^rank), row r at bits 16r.
