@@ -124,7 +124,7 @@ hard part of the stage more often. Both first give stage 0 2M more games (`stage
 carry on with stage 1. Progress lines count normal starts only, so they compare with main's.
 
 x5 trains the main method (5 stages, TD(0.5), zero init) on the 8x6-tuple network from scratch, with
-x4b's hard starts and tile-upgrading, 10M games per stage like main. 8x6 runs at about a third of
+x4b's hard starts and tile-upgrading, 10M games per stage like main, cosine alpha in all stages. 8x6 runs at about a third of
 4x6's speed, so it is the slowest chain.
 
 ## Design notes
