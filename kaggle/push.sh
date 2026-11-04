@@ -7,6 +7,7 @@
 #   hours: budget per session, default 11 (Kaggle CPU sessions stop at 12h)
 #   SEED: an extra kernel to resume from on the first push of an experiment (e.g. sixteen-train, to
 #         start from the main run's checkpoint); later pushes list only the kernel itself
+#   exit status: 0 pushed, 75 all of Kaggle's batch CPU sessions are busy (retry later), else failed
 #   MIN_GAMES: the session refuses to train unless it finds a checkpoint with at least this many
 #              games in total (kaggle/chain.sh sets it), so a broken chain never restarts from scratch
 #
@@ -93,6 +94,13 @@ cat > "$out/kernel-metadata.json" <<EOF
 }
 EOF
 
-kaggle kernels push -p "$out"
+# the CLI exits 0 even when Kaggle refuses the push, so read its message
+msg=$(kaggle kernels push -p "$out" 2>&1) || true
+echo "$msg"
+if ! grep -q "successfully pushed" <<< "$msg"; then
+  # all batch CPU sessions busy: try again later (exit 75 = EX_TEMPFAIL, chain.sh retries next run)
+  grep -qi "session count" <<< "$msg" && exit 75
+  exit 1
+fi
 echo "status: kaggle kernels status $user/$slug"
 echo "output: kaggle kernels output $user/$slug -p <dir>"

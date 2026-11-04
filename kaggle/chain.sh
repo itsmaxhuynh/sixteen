@@ -12,6 +12,7 @@
 #                      forward (more games, or more collected boards), then push the next session with
 #                      MIN_GAMES set so it refuses to start without that checkpoint
 #   all stages trained stop chaining (state: halted=done)
+#   no free session    (push.sh exits 75) nothing recorded, the next run tries again
 #   anything else      push nothing, record why (halted=<reason>) and exit 1 so someone looks
 #   (a failed status call or download only fails this run; the next run tries again)
 #
@@ -119,7 +120,13 @@ if [ "$games" -eq "$last_games" ] && [ "$boards" -le "$last_boards" ]; then
 fi
 
 # ---- push the next session; it must find at least these games
-EXP="$exp" MIN_GAMES="$games" $PUSH "$user" 11 || halt "push failed"
+rc=0
+EXP="$exp" MIN_GAMES="$games" $PUSH "$user" 11 || rc=$?
+if [ "$rc" -eq 75 ]; then
+  echo "no free Kaggle CPU session; the next run tries again"
+  exit 1
+fi
+[ "$rc" -eq 0 ] || halt "push failed (exit $rc)"
 last_games=$games last_boards=$boards pushed_at=$NOW pushes=$((pushes + 1))
 save_state
 note "PUSH #$pushes: from games=$games ($games_list) boards=$boards"
