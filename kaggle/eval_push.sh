@@ -5,16 +5,18 @@
 #        kaggle/eval_push.sh <kaggle-username> <kernel> [kernel ...]
 #   kernel: training kernels whose output (sixteen.ckpt) to evaluate, e.g. sixteen-train sixteen-x4b
 #   THREADS: 1 keeps the move times meaningful (see eval.sh)
+#   NAME: kernel slug to push (default sixteen-eval); another name runs beside a busy one
 #   RUNS: instead of PLIES/EXTRA/GAMES, a list of "ply:extra:games" separated by ';', e.g.
 #         RUNS="3:prune=0.001:1000;4:prune=0.001:300" (extra may be empty: "3::1000")
-# Results: kaggle kernels output <user>/sixteen-eval -p <dir> (eval.txt), or the live log.
+# Results: kaggle kernels output <user>/$NAME -p <dir> (eval.txt), or the live log.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 user="${1:?usage: kaggle/eval_push.sh <kaggle-username> <kernel> [kernel ...]}"
 shift
-[ $# -ge 1 ] || { sed -n '2,9p' "$0"; exit 1; }
-out="kaggle/build-eval"
+[ $# -ge 1 ] || { sed -n '2,10p' "$0"; exit 1; }
+name="${NAME:-sixteen-eval}"
+out="kaggle/build-${name#sixteen-}"
 mkdir -p "$out"
 
 sources=$(tar czf - makefile *.h sixteen.cpp eval.sh | base64 -w0)
@@ -30,8 +32,8 @@ EOF
 kernels=$(for k in "$@"; do printf '"%s/%s", ' "$user" "$k"; done | sed 's/, $//')
 cat > "$out/kernel-metadata.json" <<EOF
 {
-  "id": "$user/sixteen-eval",
-  "title": "sixteen-eval",
+  "id": "$user/$name",
+  "title": "$name",
   "code_file": "eval.py",
   "language": "python",
   "kernel_type": "script",
@@ -48,4 +50,4 @@ EOF
 msg=$(kaggle kernels push -p "$out" 2>&1) || true
 echo "$msg"
 grep -q "successfully pushed" <<< "$msg" || exit 1
-echo "status: kaggle kernels status $user/sixteen-eval"
+echo "status: kaggle kernels status $user/$name"
