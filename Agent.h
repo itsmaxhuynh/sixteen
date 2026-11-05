@@ -209,14 +209,25 @@ public:
 
         const float alpha = Alpha(active_games_.load(std::memory_order_relaxed));
         std::vector<float> value(T); // V(s'_t) after its own update
+        // the backward pass knows every board in advance: prefetch kAhead steps ahead, so a step's
+        // memory reads overlap the steps before it (same reads and updates as without it)
+        constexpr size_t kAhead = 4;
+        NTupleNetwork::Lookup ring[kAhead + 1];
+        auto prepare = [&](size_t i) {
+            network_.Prepare(after[i], ring[i % (kAhead + 1)]);
+            network_.Prefetch(ring[i % (kAhead + 1)], stage[i]);
+        };
+        for (size_t i = T; i-- > 0 && T - i <= kAhead;) prepare(i);
         for (size_t t = T; t-- > 0;) {
+            if (t >= kAhead) prepare(t - kAhead);
+            const NTupleNetwork::Lookup &l = ring[t % (kAhead + 1)];
             float target = LambdaReturn(rewards, value, t, state_.lambda, kReturns);
             if (stage[t] == state_.active) {
-                float v = network_.GetValue(after[t], stage[t]);
+                float v = network_.GetValue(l, stage[t]);
                 if (tc_) network_.UpdateValueTC(after[t], stage[t], alpha, target - v, tc_e_, tc_a_);
-                else network_.UpdateValue(after[t], stage[t], alpha * (target - v));
+                else network_.UpdateValue(l, stage[t], alpha * (target - v));
             }
-            value[t] = network_.GetValue(after[t], stage[t]);
+            value[t] = network_.GetValue(l, stage[t]);
         }
         active_games_.fetch_add(1, std::memory_order_relaxed);
     }
@@ -380,8 +391,36 @@ private:
         return network_.GetValue(b, Resolve(std::max(game_stage, Split(b))));
     }
 
+    // MaxNode at ply 1 (every training move): slide all four ways and prefetch the children's
+    // weights first, so their memory reads overlap; then value them in the same order as MaxNode
+    std::pair<int, float> GreedyNode(const Board64 &board, int game_stage) const {
+        NTupleNetwork::Lookup lookup[4];
+        reward_t reward[4];
+        int stage[4];
+        for (int d = 0; d < 4; ++d) {
+            Board64 child = board;
+            reward[d] = child.Slide(d);
+            if (reward[d] == -1) continue;
+            stage[d] = Resolve(std::max(game_stage, Split(child.GetBoard())));
+            network_.Prepare(child.GetBoard(), lookup[d]);
+            network_.Prefetch(lookup[d], stage[d]);
+        }
+        int direction = -1;
+        float best = -INFINITY;
+        for (int d = 0; d < 4; ++d) {
+            if (reward[d] == -1) continue;
+            float value = reward[d] + network_.GetValue(lookup[d], stage[d]);
+            if (value > best) {
+                best = value;
+                direction = d;
+            }
+        }
+        return {direction, direction == -1 ? 0.0f : best}; // no legal move: game over, value 0
+    }
+
     // max node: the player moves; value = reward + value of the afterstate
     std::pair<int, float> MaxNode(const Board64 &board, int ply, int game_stage) const {
+        if (ply <= 1) return GreedyNode(board, game_stage);
         int direction = -1;
         float best = -INFINITY;
         for (int d = 0; d < 4; ++d) {

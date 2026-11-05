@@ -360,6 +360,38 @@ public:
         return value;
     }
 
+    /**
+     * A board's feature indices, computed once (FeatureIndices order), so the weights can be
+     * prefetched before they are read: lookups are random reads into tables far bigger than the
+     * caches, and a GetValue that waits for them one board at a time is most of training's time.
+     * GetValue/UpdateValue on a Lookup read and sum exactly the weights, in exactly the order, of
+     * GetValue/UpdateValue on the board (tests.cpp checks it), so results stay bit-identical.
+     */
+    struct Lookup {
+        uint32_t table[kMaxFeatures];
+        size_t index[kMaxFeatures];
+        int n = 0;
+    };
+
+    void Prepare(board_t b, Lookup &l) const { l.n = FeatureIndices(b, l.table, l.index); }
+
+    void Prefetch(const Lookup &l, int stage) const {
+        const std::vector<std::vector<float>> &w = weights_[stage];
+        for (int k = 0; k < l.n; ++k) __builtin_prefetch(w[l.table[k]].data() + l.index[k]);
+    }
+
+    float GetValue(const Lookup &l, int stage) const {
+        const std::vector<std::vector<float>> &w = weights_[stage];
+        float value = 0;
+        for (int k = 0; k < l.n; ++k) value += LoadWeight(w[l.table[k]][l.index[k]]);
+        return value;
+    }
+
+    void UpdateValue(const Lookup &l, int stage, float delta) {
+        std::vector<std::vector<float>> &w = weights_[stage];
+        for (int k = 0; k < l.n; ++k) AddWeight(w[l.table[k]][l.index[k]], delta);
+    }
+
     // adds delta to the weight of every occurring feature, i.e. delta = alpha * td_error
     void UpdateValue(board_t b, int stage, float delta) {
         if (!fast_tuples_) return UpdateValueGeneric(b, stage, delta);

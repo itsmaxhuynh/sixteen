@@ -707,7 +707,7 @@ static void TestGenericValue() {
                 w = float(int64_t(x % 2000001) - 1000000) * 0.001f;
             }
         }
-        int bad = 0, bad_list = 0;
+        int bad = 0, bad_list = 0, bad_lookup = 0;
         for (size_t k = 0; k < boards.size(); k += (patterns.size() == 8 ? 3 : 1)) {
             board_t b = boards[k];
             float ref = net.GetValueReference(b, 0);
@@ -718,8 +718,12 @@ static void TestGenericValue() {
             float sum = 0;
             for (int i = 0; i < n; ++i) sum += net.StageWeights(0)[table[i]][index[i]];
             bad_list += n != net.NumActiveFeatures() || sum != ref;
+            NTupleNetwork::Lookup l; // the prefetching path: same weights, same order
+            net.Prepare(b, l);
+            net.Prefetch(l, 0);
+            bad_lookup += net.GetValue(l, 0) != ref;
         }
-        CHECK(bad == 0 && bad_list == 0);
+        CHECK(bad == 0 && bad_list == 0 && bad_lookup == 0);
         CHECK(net.FastTuples() == (patterns == NTupleNetwork::DefaultPatterns()));
 
         // updates: from zero weights, fast +1 then reference -1 restores all zeros
@@ -729,10 +733,15 @@ static void TestGenericValue() {
             net.UpdateValue(boards[k], 0, 1.0f);
             moved += net.GetValueReference(boards[k], 0) != 0.0f;
             net.UpdateValueReference(boards[k], 0, -1.0f);
+            NTupleNetwork::Lookup l;
+            net.Prepare(boards[k], l);
+            net.UpdateValue(l, 0, 1.0f);
+            moved += net.GetValueReference(boards[k], 0) != 0.0f;
+            net.UpdateValueReference(boards[k], 0, -1.0f);
         }
         bad = 0;
         for (const std::vector<float> &t : net.StageWeights(0)) for (float w : t) bad += w != 0.0f;
-        CHECK(bad == 0 && moved > 100);
+        CHECK(bad == 0 && moved > 200);
     }
 }
 
