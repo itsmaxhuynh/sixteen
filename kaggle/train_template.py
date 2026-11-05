@@ -190,7 +190,10 @@ def main():
                      f"lambda={CONFIG['lambda']} init={init}"])
                 ckpt = CKPT
         else:
-            log(f"all {meta['stages']} stages trained: {meta['games']}")
+            msg = f"all {meta['stages']} stages trained: {meta['games']}"
+            log(msg)
+            with open(os.path.join(WORK, "train.log"), "a") as out:  # chain.sh looks for it there
+                out.write(msg + "\n")
             break
 
     # the output must always hold the latest checkpoint, even if this session only collected boards
