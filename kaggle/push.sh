@@ -32,7 +32,9 @@ sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
 # Per stage (list index = stage): alpha schedule ('step' as in [MS-TD], or 'cos' annealing down to
 # alpha_min) and the value every board starts at when the stage is created (0 = [MS-TD]'s zero init,
 # e.g. 320000 = optimistic init). Only stages that have not started yet should be changed.
-anneal="['step', 'cos', 'cos', 'cos', 'cos']"
+# Cosine in every stage. The main run's stage 0 trained with 'step' and is finished; x4a/x4b inherit
+# that stage 0 and start their fine-tune games after it, so changing it here affects new runs only.
+anneal="['cos', 'cos', 'cos', 'cos', 'cos']"
 init="[0, 0, 0, 0, 0]"
 config="{'stages': 5, 'lambda': 0.5, 'games_per_stage': 10000000, 'decay_at': 5000000, 'collect': 100000, 'hours': $hours, 'margin_minutes': 20, 'threads': None, 'block': 10000, 'save_every': 200000, 'min_games': ${MIN_GAMES:-0}, 'anneal': $anneal, 'alpha_min': 0.000025, 'init': $init}"
 
@@ -53,12 +55,11 @@ case "$exp" in
   # up to 500 slides before the end of a game; x4b also doubles a tile of 30% of the start boards.
   x4a) override="{'stage_games': [12000000], 'hard': 0.5, 'hard_rewind': 500}" ;;
   x4b) override="{'stage_games': [12000000], 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
-  # x5: the main method (5 stages, TD(0.5), step then cosine alpha, zero init) on the 8x6-tuple
-  # network, trained from scratch with hard starts and tile-upgrading as in x4b, 10M games per stage
-  # like main, cosine alpha in every stage (main's stage 0 keeps 'step' only because it began with it;
-  # x5's first session ran at the fixed 0.0025, close to the top of the cosine curve it then joins).
+  # x5: the main method (5 stages, TD(0.5), cosine alpha, zero init) on the 8x6-tuple network,
+  # trained from scratch with hard starts and tile-upgrading as in x4b, 10M games per stage like main
+  # (x5's first session ran at the fixed 0.0025, close to the top of the cosine curve it then joins).
   # 8x6 runs at about a third of 4x6's moves/s, so this is the slowest chain.
-  x5) override="{'patterns': '8x6', 'anneal': ['cos', 'cos', 'cos', 'cos', 'cos'], 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
+  x5) override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
