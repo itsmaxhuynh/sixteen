@@ -286,17 +286,18 @@ public:
                 for (int iso = 0; iso < 8; ++iso) table[n] = p, index[n++] = idx[p][iso];
             }
         } else {
-            board_t img[8];
+            board_t img[8], x[8];
             fast::Images(b, img);
             const int *order = fast::Order().image;
+            for (int iso = 0; iso < 8; ++iso) x[iso] = img[order[iso]]; // x(cell) = b(Transform(cell, iso))
             for (size_t p = 0; p < patterns_.size(); ++p) {
-                const std::vector<Run> &runs = runs_[p];
-                for (int iso = 0; iso < 8; ++iso) {
-                    board_t x = img[order[iso]]; // x(cell) = b(Transform(cell, iso))
-                    size_t i = 0;
-                    for (const Run &r : runs) i |= size_t((r.right ? x >> r.shift : x << r.shift) & r.mask);
-                    table[n] = uint32_t(p), index[n++] = i;
+                // runs outside, the 8 images inside: one shift and mask for all 8, so it vectorizes
+                board_t idx[8] = {};
+                for (const Run &r : runs_[p]) {
+                    if (r.right) for (int iso = 0; iso < 8; ++iso) idx[iso] |= (x[iso] >> r.shift) & r.mask;
+                    else for (int iso = 0; iso < 8; ++iso) idx[iso] |= (x[iso] << r.shift) & r.mask;
                 }
+                for (int iso = 0; iso < 8; ++iso) table[n] = uint32_t(p), index[n++] = size_t(idx[iso]);
             }
         }
         if (features_) {
