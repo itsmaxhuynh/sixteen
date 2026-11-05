@@ -43,6 +43,16 @@ inline board_t DowngradeRoot(board_t b, int min_rank) {
 }
 
 /**
+ * Depth for one move with deep=e1,e2,...: one extra ply for each threshold the board's empty cells
+ * are at or below. Few empty cells make chance nodes cheap (few spawn cells) and the position
+ * dangerous, so that is where depth is both affordable and worth most.
+ */
+inline int AdaptivePly(int ply, int empty, const std::vector<int> &deep) {
+    for (int e : deep) ply += empty <= e;
+    return ply;
+}
+
+/**
  * Expectimax search for match play ([MS-TD] Fig. 2) with
  *   - a position cache: chance-node values keyed by (afterstate, plies left, stage), kept across
  *     the moves of a game. Entries match the plies exactly, so a cached search returns exactly

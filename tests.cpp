@@ -440,6 +440,16 @@ static void TestSearchTimed() {
     CHECK(s.Timed(full, 0, 5.0).move == -1);
 }
 
+// deep=e1,e2,...: one more ply per threshold the empty cells are at or below (inclusive)
+static void TestAdaptivePly() {
+    std::vector<int> none, deep = {4, 1};
+    for (int empty = 0; empty <= 16; ++empty) {
+        CHECK(AdaptivePly(3, empty, none) == 3);
+        int want = empty <= 1 ? 5 : empty <= 4 ? 4 : 3;
+        CHECK(AdaptivePly(3, empty, deep) == want);
+    }
+}
+
 // tile-downgrading written out on a grid: the rank r above which tiles halve (largest missing rank
 // with 3 <= r < top), or -1 when downgrading does not apply
 static int NaiveSkippedRank(board_t b, int min_rank) {
@@ -873,6 +883,7 @@ int main() {
     TestDowngradePlayer();
     TestSearchExact();
     TestSearchTimed();
+    TestAdaptivePly();
     TestFastTupleIndices();
     TestFastScalarFeatures();
     TestFastValue();

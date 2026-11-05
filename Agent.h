@@ -438,6 +438,8 @@ private:
  *   prune=<p>    do not search spawn outcomes whose path probability is below p (default 0 = off)
  *   downgrade=<tile>  tile-downgrading at the root once the largest tile is >= tile, e.g. 32768
  *                (see DowngradeRoot in Search.h; default 0 = off)
+ *   deep=<e1>,<e2>,...  fixed-ply mode: one more ply for each e the root's empty cells are <= to,
+ *                e.g. ply=3 deep=4,1 searches 3 plies, 4 at <= 4 empty cells, 5 at <= 1 (default off)
  * Search (ply > 1 or time=) goes through Search.h; ply=1 stays on the cheap training path.
  */
 class TdPlayer : public Agent {
@@ -484,7 +486,7 @@ public:
             move = learner_->BestMove(root, ply_, stage);
         } else {
             Search<TdLearner>::Result r = time_ms_ > 0 ? search_->Timed(root, stage, time_ms_, hard_ms_, max_ply_)
-                                                       : search_->Fixed(root, ply_, stage);
+                                                       : search_->Fixed(root, AdaptivePly(ply_, root.CountEmpty(), deep_), stage);
             move = r.move;
             ply_sum_ += r.ply;
             ply_moves_++;
@@ -521,7 +523,19 @@ private:
                 throw std::invalid_argument("downgrade must be 0 or a tile 16..32768");
             if (tile) downgrade_rank_ = __builtin_ctz(tile);
         }
-        if (ply_ > 1 || time_ms_ > 0) {
+        deep_.clear();
+        if (Has("deep")) {
+            std::string list = meta_["deep"].value;
+            for (size_t at = 0; at < list.size();) {
+                size_t comma = std::min(list.find(',', at), list.size());
+                int e = std::stoi(list.substr(at, comma - at));
+                if (e < 0 || e > 16) throw std::invalid_argument("deep: empty-cell counts are 0..16");
+                deep_.push_back(e);
+                at = comma + 1;
+            }
+            if (time_ms_ > 0 && !deep_.empty()) throw std::invalid_argument("deep= is for fixed ply, not time=");
+        }
+        if (ply_ > 1 || time_ms_ > 0 || !deep_.empty()) {
             search_.reset(new Search<TdLearner>(*learner_, Has("tt") ? int(meta_["tt"]) : 22));
             if (Has("prune")) search_->SetPrune(float(meta_["prune"]));
         }
@@ -534,5 +548,6 @@ private:
     int max_ply_ = 8;
     int game_stage_ = 0;
     int downgrade_rank_ = 0;
+    std::vector<int> deep_;
     uint64_t ply_sum_ = 0, ply_moves_ = 0, downgraded_ = 0;
 };

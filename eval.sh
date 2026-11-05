@@ -29,14 +29,14 @@ shift $((OPTIND - 1))
 [ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 1; }
 
 make -s sixteen
-printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s\n" checkpoint ply "mean ± ci95" "8192 %" "16384 %" "32768 %" "move_us" "max_ms" "over"
+printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s %7s\n" checkpoint ply "mean ± ci95" "8192 %" "16384 %" "32768 %" "move_us" "max_ms" "over" "avg_ply"
 for ckpt in "$@"; do
   for ply in $plies; do
     line=$(./sixteen --threads="$threads" --total="$games" --seed="$seed" --summary \
              --play="load=$ckpt ply=$ply $extra" 2>/dev/null | grep '^eval:')
     get() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<< "$line"; }
-    printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s\n" "$(basename "$ckpt")" "$ply" \
+    printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s %7s\n" "$(basename "$ckpt")" "$ply" \
       "$(get mean) ± $(get ci95)" "$(get r8192)" "$(get r16384)" "$(get r32768)" \
-      "$(get move_us)" "$(get max_move_ms)" "$(get 'over_[0-9]*ms')"
+      "$(get move_us)" "$(get max_move_ms)" "$(get 'over_[0-9]*ms')" "$(get avg_ply)"
   done
 done
