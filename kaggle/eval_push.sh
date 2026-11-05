@@ -5,6 +5,8 @@
 #        kaggle/eval_push.sh <kaggle-username> <kernel> [kernel ...]
 #   kernel: training kernels whose output (sixteen.ckpt) to evaluate, e.g. sixteen-train sixteen-x4b
 #   THREADS: 1 keeps the move times meaningful (see eval.sh)
+#   RUNS: instead of PLIES/EXTRA/GAMES, a list of "ply:extra:games" separated by ';', e.g.
+#         RUNS="3:prune=0.001:1000;4:prune=0.001:300" (extra may be empty: "3::1000")
 # Results: kaggle kernels output <user>/sixteen-eval -p <dir> (eval.txt), or the live log.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -17,7 +19,8 @@ mkdir -p "$out"
 
 sources=$(tar czf - makefile *.h sixteen.cpp eval.sh | base64 -w0)
 plies=$(python3 -c "import sys; print([int(p) for p in sys.argv[1].split()])" "${PLIES:-1 2 3}")
-config="{'plies': $plies, 'games': ${GAMES:-1000}, 'seed': ${SEED:-1}, 'threads': ${THREADS:-1}, 'extra': '${EXTRA:-}'}"
+runs=$(python3 -c "import sys; print([(int(p), x, int(g)) for p, x, g in (r.split(':') for r in sys.argv[1].split(';') if r)])" "${RUNS:-}")
+config="{'runs': $runs, 'plies': $plies, 'games': ${GAMES:-1000}, 'seed': ${SEED:-1}, 'threads': ${THREADS:-1}, 'extra': '${EXTRA:-}'}"
 python3 - "$sources" "$config" > "$out/eval.py" <<'EOF'
 import sys
 tpl = open("kaggle/eval_template.py").read()
