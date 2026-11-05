@@ -141,22 +141,38 @@ int shell(int argc, const char *argv[]) {
 }
 
 /**
- * Thread-safe progress report, printed every `block` games in the format of the Threes
+ * Thread-safe progress report, printed every `block` normal games in the format of the Threes
  * Statistic: average and max score, throughput, and per tile the reach rate and end rate.
+ * Hard and upgraded starts (HardStarts.h) begin from boards the normal game would not give, so their
+ * scores and reach rates are kept apart: the main lines count normal games only (comparable across
+ * runs and with eval), each special kind gets one extra line, and the speed counts every game played.
  */
 class Reporter {
 public:
     explicit Reporter(size_t block) : block_(block), start_(Clock::now()), block_start_(start_) {}
 
-    void Add(const Episode &game) {
+    enum Start { kNormal, kHard, kUpgraded };
+
+    void Add(const Episode &game, Start start = kNormal) {
         int split = MaxSplit(game);
         std::lock_guard<std::mutex> lock(mutex_);
+        all_games_++;
+        all_moves_ += game.step(Action::Slide::type_);
+        if (start != kNormal) {
+            Accumulate(start == kHard ? block_hard_ : block_upgraded_, game, split);
+            return;
+        }
         Accumulate(block_acc_, game, split);
         Accumulate(total_acc_, game, split);
         if (block_acc_.games == block_) {
             auto now = Clock::now();
-            Print(block_acc_, total_acc_.games, std::chrono::duration<double>(now - block_start_).count());
-            block_acc_ = {};
+            double seconds = std::chrono::duration<double>(now - block_start_).count();
+            bool special = block_hard_.games || block_upgraded_.games;
+            Print(block_acc_, total_acc_.games, seconds, all_games_, all_moves_, special ? "normal starts" : nullptr);
+            PrintSpecial(block_hard_, "hard starts");
+            PrintSpecial(block_upgraded_, "upgraded starts");
+            block_acc_ = block_hard_ = block_upgraded_ = {};
+            all_games_ = all_moves_ = 0;
             block_start_ = now;
         }
     }
@@ -175,7 +191,8 @@ public:
     void Summary(double move_limit_ms) {
         std::lock_guard<std::mutex> lock(mutex_);
         std::cout << "summary of all games:" << std::endl;
-        Print(total_acc_, total_acc_.games, std::chrono::duration<double>(Clock::now() - start_).count());
+        double seconds = std::chrono::duration<double>(Clock::now() - start_).count();
+        Print(total_acc_, total_acc_.games, seconds, total_acc_.games, total_acc_.moves, nullptr);
         const Acc &a = total_acc_;
         if (a.games == 0) return;
         // mean score with a 95% normal interval; reach rates with a 95% Wilson interval
@@ -238,12 +255,15 @@ private:
         acc.end_tile[game.state().GetMaxTile()]++;
     }
 
-    static void Print(const Acc &acc, size_t index, double seconds) {
+    // games/moves: every game played in the period (for the speed); label: tag the line as normal starts
+    static void Print(const Acc &acc, size_t index, double seconds, size_t games, size_t moves, const char *label) {
         if (acc.games == 0) return;
         std::ostringstream out;
         out << std::fixed << std::setprecision(0) << index << "\tavg = " << acc.score / acc.games << ", max = " << acc.max
-            << ", games/s = " << std::setprecision(1) << acc.games / seconds
-            << ", moves/s = " << std::setprecision(0) << acc.moves / seconds << std::endl;
+            << ", games/s = " << std::setprecision(1) << games / seconds
+            << ", moves/s = " << std::setprecision(0) << moves / seconds;
+        if (label) out << "\t(" << label << ": " << acc.games << " games; speed counts all " << games << ")";
+        out << std::endl;
         size_t reached = acc.games;
         for (int t = 0; t < 16; ++t) {
             if (acc.end_tile[t] == 0) {
@@ -267,9 +287,34 @@ private:
         std::cout << out.str() << std::endl;
     }
 
+    // a kind of special start: games, average, max, reach rates of 8192..32768 and (once some game got
+    // to 16384) of the splits
+    static void PrintSpecial(const Acc &acc, const char *label) {
+        if (acc.games == 0) return;
+        static const char *names[5] = {"", "16k", "16+8k", "16+8+4k", "16+8+4+2k"};
+        std::ostringstream out;
+        out << std::fixed << std::setprecision(0) << "\t" << label << ": " << acc.games << " games, avg = "
+            << acc.score / acc.games << ", max = " << acc.max << "\n\t\treach";
+        size_t reached = acc.games;
+        for (int t = 0; t < 16; ++t) {
+            if (t >= 13) out << std::setprecision(2) << "\t" << (1 << t) << " " << reached * 100.0 / acc.games << "%";
+            reached -= acc.end_tile[t];
+        }
+        if (acc.games > acc.split[0]) {
+            out << "\n\t\tsplits";
+            size_t at_least = acc.games - acc.split[0];
+            for (int k = 1; k <= 4; ++k) {
+                out << std::setprecision(2) << "\t" << names[k] << " " << at_least * 100.0 / acc.games << "%";
+                at_least -= acc.split[k];
+            }
+        }
+        std::cout << out.str() << std::endl << std::endl;
+    }
+
     std::mutex mutex_;
     size_t block_;
-    Acc block_acc_, total_acc_;
+    Acc block_acc_, total_acc_, block_hard_, block_upgraded_;
+    size_t all_games_ = 0, all_moves_ = 0;
     double move_time_ = 0, move_time_max_ = 0;
     size_t moves_over_limit_ = 0;
     uint64_t ply_sum_ = 0, ply_moves_ = 0, downgraded_ = 0;
@@ -417,7 +462,7 @@ int run(int argc, const char *argv[]) {
     HardStarts hard_starts(hard_pool, hard_rewind);
     if (hard > 0 || upgrade > 0)
         std::cerr << "hard starts: " << hard << " of games, rewind 1.." << hard_rewind << ", pool " << hard_pool
-                  << ", upgrade " << upgrade << " (progress lines count normal starts only)" << std::endl;
+                  << ", upgrade " << upgrade << " (progress lines: normal starts, then one line per special kind)" << std::endl;
 
     Reporter reporter(block);
     const uint64_t round_robin_base = learner->ActiveGames();
@@ -457,11 +502,11 @@ int run(int argc, const char *argv[]) {
                 evil.Seed(seed + unsigned(n));
                 start_rng.seed(seed + n);
             }
-            bool special = false; // hard or upgraded start: kept out of the progress lines and the pool
+            Reporter::Start kind = Reporter::kNormal; // hard or upgraded: own progress lines, not in the pool
             StartPosition hp;
             if (hard > 0 && coin(hard_rng) < hard && hard_starts.Sample(hard_rng, hp)) {
                 game.Start(hp.board, hp.score);
-                special = true;
+                kind = Reporter::kHard;
             } else if (!starts.empty()) {
                 size_t i = learning ? size_t((round_robin_base + n) % starts.size()) : size_t(start_rng() % starts.size());
                 game.Start(starts[i].board, starts[i].score);
@@ -470,7 +515,7 @@ int run(int argc, const char *argv[]) {
                 board_t up = UpgradeTile(game.StartBoard(), active);
                 if (up != game.StartBoard()) {
                     game.Start(up, game.score());
-                    special = true;
+                    kind = Reporter::kUpgraded;
                 }
             }
             player.OpenEpisode();
@@ -501,8 +546,8 @@ int run(int argc, const char *argv[]) {
 
             if (learning) learner->Learn(game);
             if (!learning) reporter.AddMoveTimes(move_time, move_time_max, over_limit, player.TakeMoveStats());
-            if (!special) reporter.Add(game);
-            if (hard > 0 && !special) hard_starts.Offer(game, active, split, hard_rng);
+            reporter.Add(game, kind);
+            if (hard > 0 && kind == Reporter::kNormal) hard_starts.Offer(game, active, split, hard_rng);
 
             if (time_limit > 0) {
                 std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start_time;
