@@ -56,7 +56,11 @@ inline int AdaptivePly(int ply, int empty, const std::vector<int> &deep) {
  * Expectimax search for match play ([MS-TD] Fig. 2) with
  *   - a position cache: chance-node values keyed by (afterstate, plies left, stage), kept across
  *     the moves of a game. Entries match the plies exactly, so a cached search returns exactly
- *     what the plain search would (tests.cpp checks this against TdLearner::BestMove).
+ *     what the plain search would (tests.cpp checks this against plain expectimax).
+ *   - leaf values in the same cache, keyed with plies left = 0: at 3-ply over half the leaves are
+ *     afterstates already valued (other spawn and move orders reach them), and a cached one costs
+ *     one memory read instead of the network's 64. Network values are exact, so these are stored
+ *     with pruning on as well.
  *   - time-limited iterative deepening: search 1, 2, 3, ... plies and keep the move of the deepest
  *     search that finished. A depth is started only if its predicted cost fits the budget, and an
  *     unfinished depth is dropped when the hard deadline passes.
@@ -175,14 +179,23 @@ private:
 
     // max node: the player moves; value = reward + value of the afterstate
     std::pair<int, float> MaxNode(const Board64 &board, int ply, int game_stage, float prob) {
+        // slide all four ways first; at ply 1 also start the cache reads of all four leaves, so
+        // their misses overlap instead of following one another
+        Board64 child[4];
+        reward_t reward[4];
+        for (int d = 0; d < 4; ++d) {
+            child[d] = board;
+            reward[d] = child[d].Slide(d);
+            if (ply <= 1 && table_ && reward[d] != -1) {
+                __builtin_prefetch(&table_[Hash(child[d].GetBoard(), 0, game_stage) & mask_]);
+            }
+        }
         int direction = -1;
         float best = -INFINITY;
         for (int d = 0; d < 4; ++d) {
-            Board64 child = board;
-            reward_t reward = child.Slide(d);
-            if (reward == -1) continue;
-            float value = reward + (ply <= 1 ? learner_.Evaluate(child.GetBoard(), game_stage)
-                                             : ChanceNode(child, ply - 1, game_stage, prob));
+            if (reward[d] == -1) continue;
+            float value = reward[d] + (ply <= 1 ? Leaf(child[d].GetBoard(), game_stage)
+                                                : ChanceNode(child[d], ply - 1, game_stage, prob));
             if (aborted_) return {-1, 0.0f};
             if (value > best) {
                 best = value;
@@ -190,6 +203,18 @@ private:
             }
         }
         return {direction, direction == -1 ? 0.0f : best}; // no legal move: game over, value 0
+    }
+
+    // network value of a leaf afterstate, through the cache (entries with ply 0)
+    float Leaf(board_t b, int game_stage) {
+        if (!table_) return learner_.Evaluate(b, game_stage);
+        Entry &slot = table_[Hash(b, 0, game_stage) & mask_];
+        if (slot.generation == generation_ && slot.board == b && slot.ply == 0 && slot.stage == game_stage) {
+            return slot.value;
+        }
+        float value = learner_.Evaluate(b, game_stage);
+        slot = {b, value, generation_, 0, uint8_t(game_stage)};
+        return value;
     }
 
     // chance node (afterstate): a 2 with p=0.9 or a 4 with p=0.1 on a uniformly chosen empty cell

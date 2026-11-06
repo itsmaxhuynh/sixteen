@@ -308,31 +308,33 @@ struct FakeLearner {
     int Split(board_t b) const { return SplitLevel(b, 4); }
 };
 
-// plain expectimax written out as in TdLearner (no cache, no time limit)
-static float RefMax(const FakeLearner &l, const Board64 &b, int ply, int stage, int *move);
-static float RefChance(const FakeLearner &l, const Board64 &after, int ply, int stage) {
+// plain expectimax written out as in TdLearner (no cache, no time limit); with prune > 0, a spawn
+// outcome whose path probability is below prune is valued at ply 1, as Search does
+template<class L> static float RefMax(const L &l, const Board64 &b, int ply, int stage, int *move,
+                                      float prune = 0, float prob = 1);
+template<class L> static float RefChance(const L &l, const Board64 &after, int ply, int stage, float prune, float prob) {
     stage = std::max(stage, l.Split(after.GetBoard()));
+    int empty = after.CountEmpty();
+    float p2 = prob * 0.9f / float(empty), p4 = prob * 0.1f / float(empty);
     float total = 0;
-    int empty = 0;
     for (int i = 0; i < 16; ++i) {
         if (after(i)) continue;
-        ++empty;
         Board64 two = after, four = after;
         two.Set(i, 1);
         four.Set(i, 2);
-        total += 0.9f * RefMax(l, two, ply, stage, nullptr);
-        total += 0.1f * RefMax(l, four, ply, stage, nullptr);
+        total += 0.9f * RefMax(l, two, prune > 0 && p2 < prune ? 1 : ply, stage, nullptr, prune, p2);
+        total += 0.1f * RefMax(l, four, prune > 0 && p4 < prune ? 1 : ply, stage, nullptr, prune, p4);
     }
-    return empty ? total / empty : 0.0f;
+    return empty ? total / float(empty) : 0.0f;
 }
-static float RefMax(const FakeLearner &l, const Board64 &b, int ply, int stage, int *move) {
+template<class L> static float RefMax(const L &l, const Board64 &b, int ply, int stage, int *move, float prune, float prob) {
     int dir = -1;
     float best = -INFINITY;
     for (int d = 0; d < 4; ++d) {
         Board64 c = b;
         reward_t r = c.Slide(d);
         if (r == -1) continue;
-        float v = r + (ply <= 1 ? l.Evaluate(c.GetBoard(), stage) : RefChance(l, c, ply - 1, stage));
+        float v = r + (ply <= 1 ? l.Evaluate(c.GetBoard(), stage) : RefChance(l, c, ply - 1, stage, prune, prob));
         if (v > best) { best = v; dir = d; }
     }
     if (move) *move = dir;
@@ -393,6 +395,59 @@ static void TestSearchExact() {
         }
     }
     CHECK(bad == 0);
+}
+
+static std::shared_ptr<TdLearner> MakeLearner(const std::string &args);
+
+// Search on the real learner == plain expectimax on its Evaluate, with and without the cache, with and without pruning
+static void TestSearchLearner() {
+    // 5 trained stages with different random weights, so a leaf valued at the wrong stage shows
+    NTupleNetwork net(5, kFeatAll, {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}});
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<float> w(-50, 50);
+    for (int s = 0; s < 5; ++s) {
+        net.InitStage(s);
+        for (auto &table : net.StageWeights(s)) for (float &x : table) x = w(rng);
+    }
+    TrainingState st;
+    st.active = 4;
+    st.games = {1, 1, 1, 1, 1};
+    std::string ckpt = "/tmp/sixteen-search.ckpt";
+    if (const char *dir = std::getenv("TMPDIR")) ckpt = std::string(dir) + "/sixteen-search.ckpt";
+    net.Save(ckpt, st);
+    auto l = MakeLearner("load=" + ckpt);
+    Search<TdLearner> cached(*l, 16), uncached(*l, 0), pruned(*l, 16);
+    const float prune = 0.05f;
+    pruned.SetPrune(prune);
+    // plus boards where a slide merges two equal big tiles into a new split tile (two 8192s into
+    // 16384, two 4096s next to a 16384 into 8192), so a leaf's stage is above its parent's
+    std::vector<Board64> boards = SearchBoards(150);
+    for (int k = 0; k < 60; ++k) {
+        Board64 b;
+        for (int i = 0; i < 16; ++i) b.Set(i, rng() % 3 ? 1 + rng() % 6 : 0);
+        int big = k % 2 ? 12 : 13, row = rng() % 4;
+        b.Set(4 * row, big);
+        b.Set(4 * row + 1, big);
+        if (k % 2) b.Set(4 * ((row + 2) % 4) + 3, 14);
+        if (!b.IsTerminal()) boards.push_back(b);
+    }
+    int bad = 0, n = 0, pruned_differs = 0;
+    for (const Board64 &b : boards) {
+        int stage = l->Split(b.GetBoard());
+        for (int ply = 1; ply <= 3; ++ply) {
+            int want, want_pruned;
+            RefMax(*l, b, ply, stage, &want);
+            RefMax(*l, b, ply, stage, &want_pruned, prune);
+            bad += cached.Fixed(b, ply, stage).move != want;
+            bad += uncached.Fixed(b, ply, stage).move != want;
+            bad += pruned.Fixed(b, ply, stage).move != want_pruned;
+            pruned_differs += want_pruned != want;
+            ++n;
+        }
+    }
+    CHECK(n > 400 && bad == 0);
+    CHECK(pruned_differs > 0); // the pruned search really searched something else
+    std::remove(ckpt.c_str());
 }
 
 // time-limited search: a legal move, at least 2 plies, the deepest finished depth's move, and
@@ -891,6 +946,7 @@ int main() {
     TestDowngrade();
     TestDowngradePlayer();
     TestSearchExact();
+    TestSearchLearner();
     TestSearchTimed();
     TestAdaptivePly();
     TestFastTupleIndices();
