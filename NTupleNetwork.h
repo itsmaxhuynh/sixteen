@@ -10,6 +10,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 #ifdef __linux__
 #include <sys/mman.h>
@@ -196,6 +197,77 @@ inline const RowFacts &Rows() {
     return *rows;
 }
 
+/**
+ * Matsuzaki's 8x6-tuple network (NTupleNetwork::Patterns8x6 reads its cells from here), with each
+ * tuple's runs (cells consecutive in both the tuple and the board, moved by one shift and mask)
+ * worked out at compile time. Every shift and mask is then a constant, so the 8 images of a run
+ * take one vector shift, and, or per 4 images with AVX2. The generic path does the same steps
+ * with runs read from memory, one image at a time.
+ */
+inline constexpr int kPatterns8x6[8][6] = {
+        {0, 1, 2, 4, 5, 6},
+        {1, 2, 5, 6, 9, 13},
+        {0, 1, 2, 3, 4, 5},
+        {0, 1, 5, 6, 7, 10},
+        {0, 1, 2, 5, 9, 10},
+        {0, 1, 5, 9, 13, 14},
+        {0, 1, 5, 8, 9, 13},
+        {0, 1, 2, 4, 6, 10},
+};
+
+struct ConstRun {
+    bool right = false;
+    int shift = 0;
+    board_t mask = 0;
+};
+
+struct ConstRuns {
+    ConstRun run[6];
+    int n = 0;
+};
+
+// the runs of a tuple, as NTupleNetwork::Configure computes them
+constexpr ConstRuns MakeRuns(const int (&p)[6]) {
+    ConstRuns out;
+    for (int k = 0; k < 6;) {
+        int len = 1;
+        while (k + len < 6 && p[k + len] == p[k] + len) ++len;
+        int from = 4 * p[k], to = 4 * k;
+        out.run[out.n++] = {from >= to, from >= to ? from - to : to - from, ((board_t(1) << (4 * len)) - 1) << to};
+        k += len;
+    }
+    return out;
+}
+
+template<int P>
+inline constexpr ConstRuns kRuns8x6 = MakeRuns(kPatterns8x6[P]);
+
+template<int P, int R>
+inline void ApplyRun8x6(const board_t *x, board_t *idx) {
+    if constexpr (R < kRuns8x6<P>.n) {
+        constexpr ConstRun r = kRuns8x6<P>.run[R];
+        for (int iso = 0; iso < 8; ++iso) idx[iso] |= r.right ? (x[iso] >> r.shift) & r.mask : (x[iso] << r.shift) & r.mask;
+    }
+}
+
+// idx[iso] = index of tuple P in image x[iso]
+template<int P>
+inline void Tuple8x6(const board_t *x, board_t *idx) {
+    for (int iso = 0; iso < 8; ++iso) idx[iso] = 0;
+    [&]<int... R>(std::integer_sequence<int, R...>) { (ApplyRun8x6<P, R>(x, idx), ...); }(std::make_integer_sequence<int, 6>());
+}
+
+// table, index of the 8 tuples x 8 images, in FeatureIndices order (tuple-major)
+inline void Indices8x6(const board_t *x, uint32_t *table, size_t *index) {
+    [&]<int... P>(std::integer_sequence<int, P...>) {
+        ([&] {
+            board_t idx[8];
+            Tuple8x6<P>(x, idx);
+            for (int iso = 0; iso < 8; ++iso) table[8 * P + iso] = uint32_t(P), index[8 * P + iso] = size_t(idx[iso]);
+        }(), ...);
+    }(std::make_integer_sequence<int, 8>());
+}
+
 } // namespace fast
 
 /**
@@ -225,16 +297,9 @@ public:
 
     // Matsuzaki's 8x6-tuple network, as drawn in Fig. 3 of arXiv:2111.11090 (cells 0..15 row by row)
     static std::vector<std::vector<int>> Patterns8x6() {
-        return {
-                {0, 1, 2, 4, 5, 6},
-                {1, 2, 5, 6, 9, 13},
-                {0, 1, 2, 3, 4, 5},
-                {0, 1, 5, 6, 7, 10},
-                {0, 1, 2, 5, 9, 10},
-                {0, 1, 5, 9, 13, 14},
-                {0, 1, 5, 8, 9, 13},
-                {0, 1, 2, 4, 6, 10},
-        };
+        std::vector<std::vector<int>> out;
+        for (const auto &p : fast::kPatterns8x6) out.emplace_back(std::begin(p), std::end(p));
+        return out;
     }
 
     // "4x6" (default, [MS-TD]) or "8x6"
@@ -290,7 +355,10 @@ public:
             fast::Images(b, img);
             const int *order = fast::Order().image;
             for (int iso = 0; iso < 8; ++iso) x[iso] = img[order[iso]]; // x(cell) = b(Transform(cell, iso))
-            for (size_t p = 0; p < patterns_.size(); ++p) {
+            if (tuples8x6_) {
+                fast::Indices8x6(x, table, index);
+                n = 64;
+            } else for (size_t p = 0; p < patterns_.size(); ++p) {
                 // runs outside, the 8 images inside: one shift and mask for all 8, so it vectorizes
                 board_t idx[8] = {};
                 for (const Run &r : runs_[p]) {
@@ -342,6 +410,8 @@ public:
 
     // true when the default patterns are used, so GetValue/UpdateValue take the mask-based path
     bool FastTuples() const { return fast_tuples_; }
+
+    bool Tuples8x6() const { return tuples8x6_; }
 
     float GetValue(board_t b, int stage) const {
         if (!fast_tuples_) return GetValueGeneric(b, stage);
@@ -625,6 +695,7 @@ private:
             runs_.push_back(runs);
         }
         fast_tuples_ = patterns == DefaultPatterns();
+        tuples8x6_ = patterns == Patterns8x6();
         n_stages_ = stages;
         features_ = features;
         size_t n_tables = patterns_.size() + __builtin_popcount(features_);
@@ -744,6 +815,7 @@ private:
     int n_stages_ = 1;
     uint32_t features_ = 0;
     bool fast_tuples_ = false;
+    bool tuples8x6_ = false; // Patterns8x6: FeatureIndices takes fast::Indices8x6
     std::vector<std::vector<std::vector<float>>> weights_; // [stage][table][index]
     std::vector<bool> initialized_;
 };

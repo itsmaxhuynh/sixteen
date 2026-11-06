@@ -780,6 +780,7 @@ static void TestGenericValue() {
         }
         CHECK(bad == 0 && bad_list == 0 && bad_lookup == 0);
         CHECK(net.FastTuples() == (patterns == NTupleNetwork::DefaultPatterns()));
+        CHECK(net.Tuples8x6() == (patterns == NTupleNetwork::Patterns8x6()));
 
         // updates: from zero weights, fast +1 then reference -1 restores all zeros
         for (std::vector<float> &t : net.StageWeights(0)) std::fill(t.begin(), t.end(), 0.0f);
