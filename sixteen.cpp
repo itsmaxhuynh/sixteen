@@ -201,14 +201,15 @@ public:
         double half = 1.96 * std::sqrt(std::max(var, 0.0) / n);
         std::ostringstream out;
         out << std::fixed << std::setprecision(0) << "eval: games=" << a.games << " mean=" << mean << " ci95=" << half;
+        auto rate = [&out, n](const std::string &key, size_t count) { // " key=p%[lo,hi]"
+            double p = count / n, z = 1.96, d = 1 + z * z / n;
+            double c = (p + z * z / (2 * n)) / d, h = z * std::sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d;
+            out << std::setprecision(2) << " " << key << "=" << 100 * p << "%[" << 100 * std::max(0.0, c - h) << ","
+                << 100 * std::min(1.0, c + h) << "]";
+        };
         size_t reached = a.games;
         for (int t = 0; t < 16; ++t) {
-            if (t >= 13) { // 8192, 16384, 32768
-                double p = reached / n, z = 1.96, d = 1 + z * z / n;
-                double c = (p + z * z / (2 * n)) / d, h = z * std::sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / d;
-                out << std::setprecision(2) << " r" << (1 << t) << "=" << 100 * p << "%[" << 100 * std::max(0.0, c - h) << ","
-                    << 100 * std::min(1.0, c + h) << "]";
-            }
+            if (t >= 13) rate("r" + std::to_string(1 << t), reached); // 8192, 16384, 32768
             reached -= a.end_tile[t];
         }
         if (a.moves && move_time_ > 0) {
@@ -218,6 +219,20 @@ public:
         }
         if (ply_moves_) out << std::setprecision(2) << " avg_ply=" << double(ply_sum_) / double(ply_moves_);
         if (downgraded_) out << " downgraded_moves=" << downgraded_;
+        // the full breakdown (eval.sh prints it as a table): reach rate of every tile from 2 to 32768
+        // (games whose largest tile got at least that far), then of the stage splits
+        // ([MS-TD] T_16k, T_16+8k, T_16+8+4k, T_16+8+4+2k: the boards where stages 1..4 take over)
+        reached = a.games;
+        for (int t = 0; t < 16; ++t) {
+            if (t >= 1) rate("tile" + std::to_string(1 << t), reached);
+            reached -= a.end_tile[t];
+        }
+        static const char *splits[5] = {"", "16k", "16+8k", "16+8+4k", "16+8+4+2k"};
+        size_t at_least = a.games;
+        for (int k = 0; k <= 4; ++k) {
+            if (k >= 1) rate(std::string("split") + splits[k], at_least);
+            at_least -= a.split[k];
+        }
         std::cout << out.str() << std::endl;
     }
 

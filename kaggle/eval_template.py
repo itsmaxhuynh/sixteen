@@ -29,7 +29,8 @@ log(f"cpus {len(os.sched_getaffinity(0))}, checkpoints: {ckpts}")
 # one eval.sh call per (checkpoint, run) so each row appears in the log as soon as it is done.
 # A run is (ply, extra --play args, games); CONFIG 'runs' lists them, else every ply with 'extra'.
 runs = CONFIG.get("runs") or [(ply, CONFIG.get("extra", ""), CONFIG["games"]) for ply in CONFIG["plies"]]
-with open(os.path.join(WORK, "eval.txt"), "w") as out:
+# eval.txt: one table row per run; eval-detail.txt: each run's full tile and split breakdown
+with open(os.path.join(WORK, "eval.txt"), "w") as out, open(os.path.join(WORK, "eval-detail.txt"), "w") as detail_out:
     for path in ckpts:
         for ply, extra, games in runs:
             log(f"{path} ply {ply} {extra} games {games}")
@@ -38,12 +39,18 @@ with open(os.path.join(WORK, "eval.txt"), "w") as out:
             if extra:
                 args += ["-x", extra]
             res = subprocess.run(args + [path], capture_output=True, text=True, check=True)
-            header, row = res.stdout.strip().splitlines()[-2:]
+            lines = res.stdout.strip().splitlines()
+            at = next(i for i, line in enumerate(lines) if line.startswith("checkpoint"))
+            header, row = lines[at], lines[at + 1]
+            name = path.split(os.sep)[-2] if os.sep in path else path
+            detail = "\n".join(lines[at + 2:]).strip().replace("sixteen.ckpt", name, 1)
             if out.tell() == 0:
                 out.write(header + "  games  extra\n")
-            row = row.replace("sixteen.ckpt", path.split(os.sep)[-2] if os.sep in path else path, 1)
+            row = row.replace("sixteen.ckpt", name, 1)
             row += f"  {games:5d}  {extra}"
             out.write(row + "\n")
             out.flush()
-            print(header + "\n" + row, flush=True)
+            detail_out.write(detail + "\n\n")
+            detail_out.flush()
+            print(header + "\n" + row + "\n\n" + detail, flush=True)
 log("done")
