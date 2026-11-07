@@ -3,3 +3,4 @@
 2026-11-06 09:49 UTC PUSH #3: from games=9717120 (9717120,0) boards=0
 2026-11-06 23:26 UTC PUSH #4: from games=14281524 (10000000,4281524) boards=100000
 2026-11-07 16:17 UTC PUSH #5: from games=19809469 (10000000,9809469) boards=100000
+2026-11-07 20:26 UTC DONE: all stages trained, stages=2 active=1 features=31 alpha=0.0144928 lambda=0.5 games=10000000,10000000 initialized=1,1
