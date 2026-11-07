@@ -479,6 +479,11 @@ private:
  *                (see DowngradeRoot in Search.h; default 0 = off)
  *   deep=<e1>,<e2>,...  fixed-ply mode: one more ply for each e the root's empty cells are <= to,
  *                e.g. ply=3 deep=4,1 searches 3 plies, 4 at <= 4 empty cells, 5 at <= 1 (default off)
+ *   rootk=<k>    root move pruning: the deepest ply searches only the k best root moves of one ply
+ *                less (default 4 = off); rootcut=<f> also drops moves more than f*|best| below the
+ *                best (default 0 = off)
+ *   sample=<k>   below the first chance layer, average k of the empty cells instead of all
+ *                (default 0 = off)
  * Search (ply > 1 or time=) goes through Search.h; ply=1 stays on the cheap training path.
  */
 class TdPlayer : public Agent {
@@ -577,6 +582,13 @@ private:
         if (ply_ > 1 || time_ms_ > 0 || !deep_.empty()) {
             search_.reset(new Search<TdLearner>(*learner_, Has("tt") ? int(meta_["tt"]) : 22));
             if (Has("prune")) search_->SetPrune(float(meta_["prune"]));
+            int keep = Has("rootk") ? int(meta_["rootk"]) : 4;
+            float cut = Has("rootcut") ? float(meta_["rootcut"]) : 0.0f;
+            if (keep < 1 || keep > 4 || cut < 0) throw std::invalid_argument("rootk must be 1..4, rootcut >= 0");
+            search_->SetRootCut(keep, cut);
+            int sample = Has("sample") ? int(meta_["sample"]) : 0;
+            if (sample < 0 || sample > 16) throw std::invalid_argument("sample must be 0..16");
+            search_->SetSample(sample);
         }
     }
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -53,6 +54,25 @@ inline int AdaptivePly(int ply, int empty, const std::vector<int> &deep) {
 }
 
 /**
+ * The empty cells of a chance node to spawn on: all of them (k = 0 or k >= empty), or k of them,
+ * the first k of a shuffle seeded by the board (repeatable). Returns how many, in cells.
+ */
+inline int SpawnCells(const Board64 &after, int k, int cells[16]) {
+    int n = 0;
+    for (int i = 0; i < 16; ++i) {
+        if (after(i) == 0) cells[n++] = i;
+    }
+    if (k <= 0 || k >= n) return n;
+    uint64_t x = after.GetBoard() * 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 29)) | 1;
+    for (int i = 0; i < k; ++i) {
+        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+        std::swap(cells[i], cells[i + int(x % uint64_t(n - i))]);
+    }
+    return k;
+}
+
+/**
  * Expectimax search for match play ([MS-TD] Fig. 2) with
  *   - a position cache: chance-node values keyed by (afterstate, plies left, stage), kept across
  *     the moves of a game. Entries match the plies exactly, so a cached search returns exactly
@@ -66,6 +86,14 @@ inline int AdaptivePly(int ply, int empty, const std::vector<int> &deep) {
  *     unfinished depth is dropped when the hard deadline passes.
  *   - optional pruning: a chance outcome whose path probability falls below `prune` is valued by
  *     the network instead of being searched further (0 = off, exact expectimax).
+ *   - optional root move pruning (SetRootCut): the deepest search only looks at the root moves that
+ *     ranked best one ply shallower (the previous depth of iterative deepening, or for a fixed ply a
+ *     search one ply less first): the `keep` best, minus any whose value is more than `cut` (a
+ *     fraction of |best|) below the best. Off (keep 4, cut 0) the search is exact.
+ *   - optional sampled chance nodes (SetSample): below the first chance layer, a chance node with
+ *     more than k empty cells averages k of them (both spawns each) instead of all. The cells are
+ *     picked by a hash of the board, so a search is repeatable; sampled values are cached under
+ *     their own key and never mixed with exact ones. Off (k = 0) the search is exact.
  *
  * One Search per thread (the cache is not shared). Learner is anything with
  *   float Evaluate(board_t afterstate, int game_stage) const;  int Split(board_t) const;
@@ -97,12 +125,21 @@ public:
     }
 
     void SetPrune(float p) { prune_ = p; }
+    void SetRootCut(int keep, float cut) { root_keep_ = keep; root_cut_ = cut; }
+    void SetSample(int k) { sample_ = k >= 15 ? 0 : k; } // an afterstate has <= 15 empty cells: k >= 15 never samples
 
     // fixed depth, no time limit
     Result Fixed(const Board64 &board, int ply, int game_stage) {
         Start(INFINITY);
         Result r;
-        r.move = MaxNode(board, ply, game_stage, 1.0f).first;
+        if (RootCutOn() && ply >= 2) {
+            float values[4];
+            RootNode(board, ply - 1, game_stage, 0xf, values);
+            r.move = RootNode(board, ply, game_stage, Keep(values), values).first;
+        } else {
+            root_ply_ = ply;
+            r.move = MaxNode(board, ply, game_stage, 1.0f).first;
+        }
         r.ply = ply;
         r.ms = Elapsed();
         r.nodes = nodes_;
@@ -118,6 +155,8 @@ public:
         Start(hard_ms);
         Result r;
         double last = 0, before_last = 0; // time of the last two finished depths
+        float values[4];                  // root move values of the last finished depth
+        unsigned allowed = 0xf;
         for (int ply = 1; ply <= max_ply; ++ply) {
             if (ply > 2) {
                 // cost grows by a roughly constant factor per ply; predict the next depth from it
@@ -126,8 +165,10 @@ public:
                 if (Elapsed() + predicted > budget_ms) break;
             }
             double t0 = Elapsed();
-            std::pair<int, float> best = MaxNode(board, ply, game_stage, 1.0f);
+            std::pair<int, float> best = RootCutOn() ? RootNode(board, ply, game_stage, allowed, values)
+                                                   : (root_ply_ = ply, MaxNode(board, ply, game_stage, 1.0f));
             if (aborted_) break; // unfinished: keep the previous depth's move
+            if (RootCutOn()) allowed = Keep(values);
             r.move = best.first;
             r.ply = ply;
             before_last = last;
@@ -143,9 +184,10 @@ private:
     struct Entry {
         board_t board;
         float value;
-        uint16_t generation;
+        uint8_t generation;
         uint8_t ply;
         uint8_t stage;
+        uint8_t mode; // 0: exact; else the sampling it was valued with (see ChanceNode)
     };
     static_assert(sizeof(Entry) == 16, "cache entries should be 16 bytes");
 
@@ -167,14 +209,54 @@ private:
         return aborted_;
     }
 
-    static size_t Hash(board_t b, int ply, int stage) {
-        uint64_t x = b ^ (uint64_t(ply) << 56) ^ (uint64_t(stage) << 60);
+    static size_t Hash(board_t b, int ply, int stage, int mode = 0) {
+        uint64_t x = b ^ (uint64_t(ply) << 56) ^ (uint64_t(stage) << 60) ^ (uint64_t(mode) * 0x9E3779B97F4A7C15ULL);
         x ^= x >> 33;
         x *= 0xff51afd7ed558ccdULL;
         x ^= x >> 33;
         x *= 0xc4ceb9fe1a85ec53ULL;
         x ^= x >> 33;
         return size_t(x);
+    }
+
+    bool RootCutOn() const { return root_keep_ < 4 || root_cut_ > 0; }
+
+    // the root moves to search deeper, from their values one ply shallower (-inf: illegal)
+    unsigned Keep(const float values[4]) const {
+        int order[4] = {0, 1, 2, 3};
+        std::stable_sort(order, order + 4, [&](int a, int b) { return values[a] > values[b]; });
+        float best = values[order[0]];
+        unsigned keep = 0;
+        for (int i = 0; i < 4; ++i) {
+            float v = values[order[i]];
+            if (v == -INFINITY) break;
+            if (i > 0 && (i >= root_keep_ || (root_cut_ > 0 && v < best - root_cut_ * std::fabs(best)))) break;
+            keep |= 1u << order[i];
+        }
+        return keep;
+    }
+
+    // the root max node over the allowed moves; values[d] = each searched move's value, -inf otherwise
+    std::pair<int, float> RootNode(const Board64 &board, int ply, int game_stage, unsigned allowed, float values[4]) {
+        root_ply_ = ply;
+        int direction = -1;
+        float best = -INFINITY;
+        for (int d = 0; d < 4; ++d) {
+            values[d] = -INFINITY;
+            if (!((allowed >> d) & 1)) continue;
+            Board64 child = board;
+            reward_t reward = child.Slide(d);
+            if (reward == -1) continue;
+            float value = reward + (ply <= 1 ? Leaf(child.GetBoard(), game_stage)
+                                             : ChanceNode(child, ply - 1, game_stage, 1.0f));
+            if (aborted_) return {-1, 0.0f};
+            values[d] = value;
+            if (value > best) {
+                best = value;
+                direction = d;
+            }
+        }
+        return {direction, direction == -1 ? 0.0f : best};
     }
 
     // max node: the player moves; value = reward + value of the afterstate
@@ -209,11 +291,11 @@ private:
     float Leaf(board_t b, int game_stage) {
         if (!table_) return learner_.Evaluate(b, game_stage);
         Entry &slot = table_[Hash(b, 0, game_stage) & mask_];
-        if (slot.generation == generation_ && slot.board == b && slot.ply == 0 && slot.stage == game_stage) {
+        if (slot.generation == generation_ && slot.board == b && slot.ply == 0 && slot.stage == game_stage && slot.mode == 0) {
             return slot.value;
         }
         float value = learner_.Evaluate(b, game_stage);
-        slot = {b, value, generation_, 0, uint8_t(game_stage)};
+        slot = {b, value, generation_, 0, uint8_t(game_stage), 0};
         return value;
     }
 
@@ -221,21 +303,30 @@ private:
     float ChanceNode(const Board64 &after, int ply, int game_stage, float prob) {
         game_stage = std::max(game_stage, learner_.Split(after.GetBoard()));
         board_t b = after.GetBoard();
+        int empty = after.CountEmpty();
+        // sampled: below the first chance layer (plies left < root's - 1) with more than k empty cells.
+        // The value then depends on k, on whether this node is sampled, and (ply >= 2) on its
+        // subtree, which is always sampled (all of it is below the first layer): mode keys these
+        // apart, and stays 0 for values equal to exact expectimax.
+        bool sampled = sample_ > 0 && ply < root_ply_ - 1 && empty > sample_;
+        int mode = sample_ > 0 && (sampled || ply >= 2) ? sample_ | (sampled ? 0x80 : 0) : 0;
         Entry *slot = nullptr;
         if (table_) {
-            slot = &table_[Hash(b, ply, game_stage) & mask_];
-            if (slot->generation == generation_ && slot->board == b && slot->ply == ply && slot->stage == game_stage) {
+            slot = &table_[Hash(b, ply, game_stage, mode) & mask_];
+            if (slot->generation == generation_ && slot->board == b && slot->ply == ply && slot->stage == game_stage &&
+                slot->mode == mode) {
                 return slot->value;
             }
         }
         ++nodes_;
         if (OutOfTime()) return 0.0f;
 
-        int empty = after.CountEmpty();
+        int cells[16];
+        int n = SpawnCells(after, sampled ? sample_ : 0, cells);
         float total = 0;
         float p2 = prob * 0.9f / float(empty), p4 = prob * 0.1f / float(empty);
-        for (int i = 0; i < 16; ++i) {
-            if (after(i) != 0) continue;
+        for (int c = 0; c < n; ++c) {
+            int i = cells[c];
             Board64 two = after, four = after;
             two.Set(i, 1);
             four.Set(i, 2);
@@ -243,8 +334,8 @@ private:
             total += 0.1f * Outcome(four, ply, game_stage, p4);
             if (aborted_) return 0.0f;
         }
-        float value = empty ? total / float(empty) : 0.0f;
-        if (slot && prune_ == 0) *slot = {b, value, generation_, uint8_t(ply), uint8_t(game_stage)};
+        float value = n ? total / float(n) : 0.0f;
+        if (slot && prune_ == 0) *slot = {b, value, generation_, uint8_t(ply), uint8_t(game_stage), uint8_t(mode)};
         return value;
     }
 
@@ -257,8 +348,12 @@ private:
     const Learner &learner_;
     std::unique_ptr<Entry[]> table_;
     size_t mask_ = 0;
-    uint16_t generation_ = 1;
+    uint8_t generation_ = 1;
     float prune_ = 0;
+    int root_keep_ = 4;
+    float root_cut_ = 0;
+    int sample_ = 0;
+    int root_ply_ = 0;
     Clock::time_point start_;
     double hard_ms_ = INFINITY;
     bool aborted_ = false;

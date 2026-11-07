@@ -495,6 +495,138 @@ static void TestSearchTimed() {
     CHECK(s.Timed(full, 0, 5.0).move == -1);
 }
 
+// plain expectimax with sampled chance nodes: below the first chance layer (depth >= 2 from the
+// root), average SpawnCells(after, k) instead of every empty cell
+template<class L> static float RefSampledMax(const L &l, const Board64 &b, int ply, int stage, int k, int depth, int *move);
+template<class L> static float RefSampledChance(const L &l, const Board64 &after, int ply, int stage, int k, int depth) {
+    stage = std::max(stage, l.Split(after.GetBoard()));
+    int cells[16];
+    int n = SpawnCells(after, depth >= 2 ? k : 0, cells);
+    float total = 0;
+    for (int c = 0; c < n; ++c) {
+        Board64 two = after, four = after;
+        two.Set(cells[c], 1);
+        four.Set(cells[c], 2);
+        total += 0.9f * RefSampledMax(l, two, ply, stage, k, depth, nullptr);
+        total += 0.1f * RefSampledMax(l, four, ply, stage, k, depth, nullptr);
+    }
+    return n ? total / float(n) : 0.0f;
+}
+template<class L> static float RefSampledMax(const L &l, const Board64 &b, int ply, int stage, int k, int depth, int *move) {
+    int dir = -1;
+    float best = -INFINITY;
+    for (int d = 0; d < 4; ++d) {
+        Board64 c = b;
+        reward_t r = c.Slide(d);
+        if (r == -1) continue;
+        float v = r + (ply <= 1 ? l.Evaluate(c.GetBoard(), stage) : RefSampledChance(l, c, ply - 1, stage, k, depth + 1));
+        if (v > best) { best = v; dir = d; }
+    }
+    if (move) *move = dir;
+    return dir == -1 ? 0.0f : best;
+}
+
+// root move pruning as specified: value every root move one ply shallower, keep the `keep` best
+// minus those more than cut*|best| below the best, and pick the best kept move at the full ply
+template<class L> static int RefRootCut(const L &l, const Board64 &b, int ply, int stage, int keep, float cut) {
+    float shallow[4], deep[4];
+    for (int d = 0; d < 4; ++d) {
+        Board64 c = b;
+        reward_t r = c.Slide(d);
+        shallow[d] = deep[d] = -INFINITY;
+        if (r == -1) continue;
+        shallow[d] = r + (ply - 1 <= 1 ? l.Evaluate(c.GetBoard(), stage) : RefChance(l, c, ply - 2, stage, 0, 1));
+        deep[d] = r + (ply <= 1 ? l.Evaluate(c.GetBoard(), stage) : RefChance(l, c, ply - 1, stage, 0, 1));
+    }
+    float best = -INFINITY;
+    for (float v : shallow) best = std::max(best, v);
+    int dir = -1, rank_of[4];
+    for (int d = 0; d < 4; ++d) {
+        rank_of[d] = 0;
+        for (int e = 0; e < 4; ++e) rank_of[d] += shallow[e] > shallow[d] || (shallow[e] == shallow[d] && e < d);
+    }
+    float top = -INFINITY;
+    for (int d = 0; d < 4; ++d) {
+        if (shallow[d] == -INFINITY) continue;
+        bool kept = rank_of[d] == 0 || (rank_of[d] < keep && !(cut > 0 && shallow[d] < best - cut * std::fabs(best)));
+        if (kept && deep[d] > top) { top = deep[d]; dir = d; }
+    }
+    return dir;
+}
+
+// rootk/rootcut and sample= match their references, with the cache, across a game's searches
+// (including a tiny colliding cache and sampled/exact searches interleaved on one cache)
+static void TestSearchApprox() {
+    FakeLearner l;
+    std::vector<Board64> boards = SearchBoards(120);
+    int bad = 0, n = 0, root_differs = 0;
+    Search<FakeLearner> rc(l, 16), rc_tiny(l, 1);
+    for (auto keep_cut : std::vector<std::pair<int, float>>{{1, 0}, {2, 0}, {3, 0.05f}, {4, 0.02f}}) {
+        rc.SetRootCut(keep_cut.first, keep_cut.second);
+        rc_tiny.SetRootCut(keep_cut.first, keep_cut.second);
+        for (const Board64 &b : boards) {
+            int stage = l.Split(b.GetBoard());
+            for (int ply = 2; ply <= 3; ++ply) {
+                int want = RefRootCut(l, b, ply, stage, keep_cut.first, keep_cut.second), exact;
+                RefMax(l, b, ply, stage, &exact);
+                bad += rc.Fixed(b, ply, stage).move != want;
+                bad += rc_tiny.Fixed(b, ply, stage).move != want;
+                root_differs += want != exact;
+                ++n;
+            }
+        }
+    }
+    CHECK(n > 800 && bad == 0);
+    CHECK(root_differs > 0);
+    // timed search with root pruning: a legal move, as deep as with it off is not required
+    rc.SetRootCut(2, 0);
+    bad = 0;
+    for (const Board64 &b : boards) {
+        if (b.IsTerminal()) continue;
+        Search<FakeLearner>::Result r = rc.Timed(b, 0, 3.0, 6.0);
+        Board64 c = b;
+        bad += r.move < 0 || c.Slide(r.move) == -1;
+    }
+    CHECK(bad == 0);
+
+    // sampled chance nodes; one cache shared with exact searches of the same boards
+    Search<FakeLearner> mixed(l, 16), tiny(l, 1), sampled(l, 0);
+    int sample_differs = 0;
+    bad = n = 0;
+    for (int k : {1, 3}) {
+        sampled.SetSample(k);
+        tiny.SetSample(k);
+        for (const Board64 &b : boards) {
+            int stage = l.Split(b.GetBoard());
+            for (int ply = 2; ply <= 4; ++ply) {
+                int want, exact;
+                RefSampledMax(l, b, ply, stage, k, 0, &want);
+                RefMax(l, b, ply, stage, &exact);
+                mixed.SetSample(0);
+                bad += mixed.Fixed(b, ply, stage).move != exact;
+                mixed.SetSample(k);
+                bad += mixed.Fixed(b, ply, stage).move != want;
+                bad += tiny.Fixed(b, ply, stage).move != want;
+                bad += sampled.Fixed(b, ply, stage).move != want;
+                sample_differs += want != exact;
+                ++n;
+            }
+        }
+    }
+    CHECK(n > 600 && bad == 0);
+    CHECK(sample_differs > 0);
+    // k >= 16 never samples: exact
+    Search<FakeLearner> all(l, 16);
+    all.SetSample(16);
+    bad = 0;
+    for (const Board64 &b : boards) {
+        int want;
+        RefMax(l, b, 3, 0, &want);
+        bad += all.Fixed(b, 3, 0).move != want;
+    }
+    CHECK(bad == 0);
+}
+
 // deep=e1,e2,...: one more ply per threshold the empty cells are at or below (inclusive)
 static void TestAdaptivePly() {
     std::vector<int> none, deep = {4, 1};
@@ -949,6 +1081,7 @@ int main() {
     TestSearchExact();
     TestSearchLearner();
     TestSearchTimed();
+    TestSearchApprox();
     TestAdaptivePly();
     TestFastTupleIndices();
     TestFastScalarFeatures();
