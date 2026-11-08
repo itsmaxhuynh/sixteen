@@ -1,0 +1,5 @@
+last_games=50000000
+last_boards=0
+pushed_at=0
+pushes=0
+halted=not started: waiting for a free Kaggle slot (first push: EXP=x5s1 SEED=sixteen-x5 MIN_GAMES=50000000 kaggle/push.sh itsmaxhuynh, then reset this file)
