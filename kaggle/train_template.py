@@ -18,6 +18,14 @@
 # doubled (not in the last stage). Off when absent.
 # A stage's schedule and init can be changed for stages that have not started yet; changing them for
 # the stage in progress mixes schedules (allowed, but the cosine then starts mid-curve).
+# Single-stage sessions ('only_stage': k > 0): once every stage exists, stage k trains on its own
+# (its games start from boards<k>.bin and only read stage k's weights), so stages can train in
+# separate kernels at the same time and be merged afterwards (./sixteen --merge, Merge.h). Such a
+# session first fills boards<k>.bin to `collect` distinct boards (repeats are dropped, see
+# StartPositions.h), playing stages 0..k-1 of its checkpoint from boards<k-1>.bin, then trains stage k
+# up to stage_games[k] and stops. alpha: the stage's own schedule (for 'cos', past its end: alpha_min),
+# or with 'restart_alpha' a fresh cosine from restart_alpha down to alpha_min over the games after
+# 'restart_from' (default games_per_stage, the games the stage had when the extension started).
 # Every step resumes: the checkpoint and board files are read from /kaggle/input (the previous
 # version's output) and written to /kaggle/working.
 import base64, glob, io, os, shutil, subprocess, sys, tarfile, time
@@ -53,6 +61,15 @@ def info(path):
 
 def board_count(path):
     return max(0, (os.path.getsize(path) - 12) // 12) if os.path.exists(path) else 0
+
+
+def distinct_boards(path):
+    """boards in a board file, each board counted once (sixteen drops repeats when it next opens it)"""
+    if not os.path.exists(path):
+        return 0
+    with open(path, "rb") as f:
+        data = f.read()[12:]
+    return len({data[i:i + 8] for i in range(0, len(data) // 12 * 12, 12)})
 
 
 def boards_path(stage):
@@ -144,6 +161,42 @@ def train_args(k, games):
             f"alpha={0.00025 if decayed else 0.0025}")
 
 
+def only_stage_step(ckpt):
+    """one step of a single-stage session (see the top); returns (checkpoint, finished)"""
+    k = CONFIG["only_stage"]
+    meta = info(ckpt)
+    if not 0 < k < meta["stages"]:
+        raise SystemExit(f"only_stage={k}: needs a stage from 1 to {meta['stages'] - 1}")
+    boards = boards_path(k)
+    have = distinct_boards(boards)
+    if have < CONFIG["collect"]:
+        log(f"only stage {k}: {have}/{CONFIG['collect']} distinct boards in {boards}, collecting with stage {k - 1}")
+        start = [f"--start={boards_path(k - 1)}"] if k > 1 else []
+        run([f"--collect={boards}", f"--collect-count={CONFIG['collect']}", "--total=1000000000000"] + start +
+            [f"--play=load={ckpt} stage={k - 1}"])
+        return ckpt, False
+    games = meta["games"][k]
+    if games < target(k):
+        peak = CONFIG.get("restart_alpha")
+        if peak:
+            begin = CONFIG.get("restart_from", CONFIG["games_per_stage"])
+            alpha = (f"alpha={peak} anneal=cos anneal_games={target(k) - begin} anneal_from={begin} "
+                     f"alpha_min={CONFIG['alpha_min']}")
+            total = target(k) - games
+        else:
+            total, alpha = train_args(k, games)
+        log(f"only stage {k}: {games} games, training {total} more with {alpha}")
+        run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}", f"--start={boards}"] +
+            hard_args(k, meta["stages"]) +
+            [f"--play=load={ckpt} save={CKPT} stage={k} {alpha} lambda={CONFIG['lambda']}"])
+        return CKPT, False
+    msg = f"only stage {k}: done, stages trained: {meta['games']}"
+    log(msg)
+    with open(os.path.join(WORK, "train.log"), "a") as out:  # chain.sh looks for "stages trained"
+        out.write(msg + "\n")
+    return ckpt, True
+
+
 def main():
     ckpt = setup()
     log(f"using {threads()} thread(s), os.cpu_count()={os.cpu_count()}")
@@ -151,6 +204,13 @@ def main():
         log("no checkpoint found, starting stage 0 from scratch")
 
     while remaining() > 60:
+        if CONFIG.get("only_stage"):
+            if ckpt is None:
+                raise SystemExit("only_stage needs a checkpoint with every stage to start from")
+            ckpt, finished = only_stage_step(ckpt)
+            if finished:
+                break
+            continue
         if ckpt is None:
             total, alpha = train_args(0, 0)
             run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}"] +

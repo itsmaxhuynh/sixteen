@@ -407,6 +407,35 @@ public:
 
     // raw weight tables of one stage (tests and tools)
     std::vector<std::vector<float>> &StageWeights(int stage) { return weights_[stage]; }
+    const std::vector<std::vector<float>> &StageWeights(int stage) const { return weights_[stage]; }
+
+    // same tuples, scalar features and number of stages, so stage weights can move between the two
+    bool SameLayout(const NTupleNetwork &other) const {
+        if (n_stages_ != other.n_stages_ || features_ != other.features_ || patterns_.size() != other.patterns_.size())
+            return false;
+        for (size_t i = 0; i < patterns_.size(); ++i) {
+            if (patterns_[i].cells() != other.patterns_[i].cells()) return false;
+        }
+        return true;
+    }
+
+    // stage `stage` of both networks: both missing, or both present with bit-identical weights
+    bool SameStage(const NTupleNetwork &other, int stage) const {
+        if (initialized_[stage] != other.initialized_[stage]) return false;
+        return !initialized_[stage] || weights_[stage] == other.weights_[stage];
+    }
+
+    // frees a stage's weights (it reads as not created)
+    void DropStage(int stage) {
+        std::vector<std::vector<float>>(weights_[stage].size()).swap(weights_[stage]);
+        initialized_[stage] = false;
+    }
+
+    // replaces stage `stage` with other's (layouts must match, see SameLayout)
+    void CopyStage(const NTupleNetwork &other, int stage) {
+        weights_[stage] = other.weights_[stage];
+        initialized_[stage] = other.initialized_[stage];
+    }
 
     // true when the default patterns are used, so GetValue/UpdateValue take the mask-based path
     bool FastTuples() const { return fast_tuples_; }

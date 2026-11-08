@@ -112,6 +112,9 @@ public:
  *                 cosine annealing instead of a fixed alpha: the active stage's game g (counted
  *                 across sessions) trains with alpha_min + (alpha - alpha_min)(1 + cos(pi g / G)) / 2,
  *                 then alpha_min from game G on. Off by default: alpha is used as given.
+ *   anneal_from=<F> start that cosine at the stage's game F instead of 0: game g trains with the
+ *                 curve at g - F (alpha until F), e.g. a fresh, smaller cosine for extra games of a
+ *                 stage whose first schedule already ended (default 0)
  *   init=<V>      optimistic initialization (arXiv:2111.11090 eq. 12): a stage created by this run
  *                 starts with every weight at V / (features per state), so every board is valued V
  *                 (default 0, as in [MS-TD]). Stages that already exist are not touched.
@@ -151,6 +154,7 @@ public:
         }
         if (const std::string *v = Get(args, "anneal_games")) anneal_games_ = std::stod(*v);
         if (const std::string *v = Get(args, "alpha_min")) alpha_min_ = std::stof(*v);
+        if (const std::string *v = Get(args, "anneal_from")) anneal_from_ = std::stod(*v);
         if (cosine_ && !(anneal_games_ > 0)) throw std::invalid_argument("anneal=cos needs anneal_games > 0");
         active_games_ = state_.games[state_.active];
         if (const std::string *v = Get(args, "tc")) tc_ = *v == "1";
@@ -170,8 +174,9 @@ public:
         network_.PrintSummary(std::cerr);
         std::cerr << "learner: active stage " << state_.active << ", games/stage " << GamesString()
                   << ", alpha=" << state_.alpha << ", lambda=" << state_.lambda;
-        if (cosine_) std::cerr << ", cosine annealing to " << alpha_min_ << " over " << anneal_games_
-                               << " games (now " << Alpha(active_games_.load()) << ")";
+        if (cosine_) std::cerr << ", cosine annealing to " << alpha_min_ << " over " << anneal_games_ << " games"
+                               << (anneal_from_ > 0 ? " from game " + std::to_string(uint64_t(anneal_from_)) : "")
+                               << " (now " << Alpha(active_games_.load()) << ")";
         if (tc_) std::cerr << ", TC learning";
         std::cerr << std::endl;
     }
@@ -179,7 +184,7 @@ public:
     // step size for a game that starts when the active stage has `games` games behind it
     float Alpha(uint64_t games) const {
         if (!cosine_) return state_.alpha;
-        double progress = std::min(1.0, double(games) / anneal_games_);
+        double progress = std::min(1.0, std::max(0.0, double(games) - anneal_from_) / anneal_games_);
         return float(alpha_min_ + (state_.alpha - alpha_min_) * 0.5 * (1.0 + std::cos(M_PI * progress)));
     }
 
@@ -459,7 +464,7 @@ private:
     bool tc_ = false, tc_loaded_ = false;
     std::vector<std::vector<float>> tc_e_, tc_a_; // TC accumulators of the active stage
     bool cosine_ = false;
-    double anneal_games_ = 0;
+    double anneal_games_ = 0, anneal_from_ = 0;
     float alpha_min_ = 0;
     TrainingState state_;
     std::atomic<uint64_t> active_games_{0};

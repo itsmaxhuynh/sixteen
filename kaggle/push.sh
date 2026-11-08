@@ -60,6 +60,15 @@ case "$exp" in
   # (x5's first session ran at the fixed 0.0025, close to the top of the cosine curve it then joins).
   # 8x6 runs at about a third of 4x6's moves/s, so this is the slowest chain.
   x5) override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3}" ;;
+  # x5s1..x5s4: 10M more games for one stage of x5's finished checkpoint, each in its own kernel at
+  # the same time (single-stage sessions, see kaggle/train_template.py), merged afterwards with
+  # ./sixteen --merge. First push: SEED=sixteen-x5 MIN_GAMES=50000000. The stage's boards are first
+  # topped up to 100k distinct boards, then it trains on a fresh cosine from 0.00025 (the paper's
+  # rate after its decay) down to alpha_min, with x5's hard starts and tile-upgrading.
+  x5s[1-4])
+    k=${exp#x5s}
+    targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([20000000 if s == k else 10000000 for s in range(5)])" "$k")
+    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'restart_alpha': 0.00025, 'restart_from': 10000000}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")

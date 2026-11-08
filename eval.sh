@@ -59,12 +59,28 @@ breakdown() {
     for (k = 1; k <= ns; k++) printf "  %-17s %7.2f%%  %s\n", "split " splits[k], sreach[splits[k]], sci[splits[k]]
   }' <<< "$2"
 }
+# progress <games> <label>: passes sixteen's output through, and for each block report (one every
+# `step` games, before the final summary) prints "N/games done, elapsed, ~left" to stderr
+progress() {
+  local total=$1 label=$2 start=$SECONDS summary=0 l n el
+  while IFS= read -r l; do
+    [[ $l == "summary of all games:"* ]] && summary=1
+    if (( !summary )) && [[ $l =~ ^([0-9]+)$'\t'avg ]]; then
+      n=${BASH_REMATCH[1]} el=$((SECONDS - start))
+      printf 'progress %s: %d/%d games (%d%%), %dm elapsed, ~%dm left\n' "$label" "$n" "$total" \
+        $((100 * n / total)) $((el / 60)) $((el * (total - n) / n / 60)) >&2
+    fi
+    printf '%s\n' "$l"
+  done
+}
+step=$(( games / 20 > 0 ? games / 20 : 1 ))  # a progress line every 5% of the games
 details=""
 printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s %7s\n" checkpoint ply "mean ± ci95" "8192 %" "16384 %" "32768 %" "move_us" "max_ms" "over" "avg_ply"
 for ckpt in "$@"; do
   for ply in $plies; do
-    line=$(./sixteen --threads="$threads" --total="$games" --seed="$seed" --summary \
-             --play="load=$ckpt ply=$ply $extra" 2>/dev/null | grep '^eval:')
+    line=$(./sixteen --threads="$threads" --total="$games" --seed="$seed" --summary --block="$step" \
+             --play="load=$ckpt ply=$ply $extra" 2>/dev/null |
+           progress "$games" "$(basename "$ckpt") ply=$ply${extra:+ $extra}" | grep '^eval:')
     get() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<< "$line"; }
     printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s %7s\n" "$(basename "$ckpt")" "$ply" \
       "$(get mean) ± $(get ci95)" "$(get r8192)" "$(get r16384)" "$(get r32768)" \

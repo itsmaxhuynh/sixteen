@@ -9,6 +9,8 @@
 
 #include "Agent.h"
 #include "HardStarts.h"
+#include "Merge.h"
+#include "StartPositions.h"
 #include "Board64.h"
 #include "NTupleNetwork.h"
 
@@ -814,6 +816,12 @@ static void TestCosineAnnealing() {
     for (uint64_t g = 1; g <= 1100; ++g) monotone &= c->Alpha(g) <= c->Alpha(g - 1);
     CHECK(monotone);
     CHECK(MakeLearner("load=" + at500 + " alpha=0.01")->Alpha(500) == 0.01f); // off: alpha as given
+    // anneal_from shifts the same curve: alpha until game F, then the curve at g - F
+    auto shifted = MakeLearner("load=" + at0 + cos + " anneal_from=500");
+    CHECK(shifted->Alpha(0) == 0.01f && shifted->Alpha(500) == 0.01f);
+    CHECK(shifted->Alpha(750) == c->Alpha(250) && shifted->Alpha(1000) == c->Alpha(500));
+    CHECK(shifted->Alpha(1500) == 0.001f && shifted->Alpha(9000) == 0.001f);
+    CHECK(MakeLearner("load=" + at0 + cos + " anneal_from=0")->Alpha(300) == c->Alpha(300));
 
     // Learn uses the alpha of the stage's game count (carried by the checkpoint): a cosine learner
     // at game g learns exactly like a plain learner with alpha = Alpha(g)
@@ -1069,6 +1077,160 @@ static void TestHardStarts() {
     CHECK(ring.Sample(rng, p) && p.board != moves[idx].board);
 }
 
+static std::string TmpPath(const std::string &name) {
+    if (const char *dir = std::getenv("TMPDIR")) return std::string(dir) + "/" + name;
+    return "/tmp/" + name;
+}
+
+// a 3-stage network with every stage present and random weights, plus its training state
+static void RandomNetwork(NTupleNetwork &net, TrainingState &st, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> w(-50, 50);
+    for (int s = 0; s < net.NumStages(); ++s) {
+        net.InitStage(s);
+        for (auto &table : net.StageWeights(s)) for (float &x : table) x = w(rng);
+    }
+    st.active = net.NumStages() - 1;
+    st.games = {100, 200, 300};
+}
+
+static void TestMerge() {
+    const std::vector<std::vector<int>> layout = {{0, 1, 2, 3}, {4, 5, 6, 7}};
+    NTupleNetwork base(3, kFeatAll, layout);
+    TrainingState base_state;
+    RandomNetwork(base, base_state, 5);
+    std::string base_path = TmpPath("sixteen-merge-base.ckpt");
+    base.Save(base_path, base_state);
+
+    // two sessions from the base: one trains stage 1, the other stage 2 (as TdLearner would: only
+    // the active stage's weights and game count change)
+    auto session = [&](int stage, uint64_t extra, unsigned seed) {
+        NTupleNetwork net(1, 0, {});
+        TrainingState st;
+        net.Load(base_path, st);
+        std::mt19937_64 rng(seed);
+        for (int i = 0; i < 2000; ++i) net.UpdateValue(board_t(rng()), stage, 0.5f);
+        st.games[stage] += extra;
+        st.active = stage;
+        std::string path = TmpPath("sixteen-merge-s" + std::to_string(stage) + ".ckpt");
+        net.Save(path, st);
+        return path;
+    };
+    std::string p1 = session(1, 50, 1), p2 = session(2, 70, 2);
+    NTupleNetwork s1(1, 0, {}), s2(1, 0, {});
+    TrainingState t1, t2;
+    s1.Load(p1, t1);
+    s2.Load(p2, t2);
+
+    std::string out = TmpPath("sixteen-merge-out.ckpt");
+    std::ostringstream log;
+    TrainingState returned = MergeFiles(base_path, {{1, p1}, {2, p2}}, out, log);
+    NTupleNetwork merged(1, 0, {});
+    TrainingState ms;
+    merged.Load(out, ms);
+    CHECK(merged.SameLayout(base));
+    CHECK(merged.SameStage(base, 0) && merged.SameStage(s1, 1) && merged.SameStage(s2, 2));
+    CHECK(!merged.SameStage(base, 1) && !merged.SameStage(base, 2));
+    CHECK((ms.games == std::vector<uint64_t>{100, 250, 370}) && ms.active == 2 && returned.games == ms.games);
+    CHECK(ms.alpha == base_state.alpha && ms.lambda == base_state.lambda);
+    // values: a stage-k board is valued exactly as in the session that trained stage k
+    std::mt19937_64 rng(9);
+    int wrong = 0;
+    for (int i = 0; i < 500; ++i) {
+        board_t b = rng();
+        wrong += merged.GetValue(b, 0) != base.GetValue(b, 0);
+        wrong += merged.GetValue(b, 1) != s1.GetValue(b, 1);
+        wrong += merged.GetValue(b, 2) != s2.GetValue(b, 2);
+    }
+    CHECK(wrong == 0);
+    std::remove(out.c_str());
+
+    // a bad part: MergeFiles throws and writes nothing, even when an earlier part was fine
+    std::string bad = TmpPath("sixteen-merge-bad.ckpt");
+    auto rejects = [&](const NTupleNetwork &part, const TrainingState &st, int stage) {
+        part.Save(bad, st);
+        std::remove(out.c_str());
+        std::ostringstream quiet;
+        bool threw = false;
+        try {
+            MergeFiles(base_path, {{3 - stage, stage == 1 ? p2 : p1}, {stage, bad}}, out, quiet);
+        } catch (const std::invalid_argument &) {
+            threw = true;
+        }
+        return threw && !std::ifstream(out);
+    };
+    CHECK(!rejects(s1, t1, 1));              // the good part itself is accepted
+    CHECK(rejects(s1, t1, 2) && rejects(s2, t2, 1)); // a session given as the wrong stage
+    TrainingState no_games = t1;
+    no_games.games[1] = base_state.games[1]; // trained nothing (by its count)
+    CHECK(rejects(s1, no_games, 1));
+    TrainingState other_counts = t1;
+    other_counts.games[0] += 1;              // stage 0 count differs: not from this base
+    CHECK(rejects(s1, other_counts, 1));
+    NTupleNetwork touched(1, 0, {});
+    TrainingState tt;
+    touched.Load(p1, tt);
+    touched.UpdateValue(board_t(12345), 0, 1.0f); // stage 0 weights changed too
+    CHECK(rejects(touched, tt, 1));
+    NTupleNetwork other_layout(3, kFeatAll, {{0, 1, 2, 3}, {4, 5, 6, 8}});
+    TrainingState ol;
+    RandomNetwork(other_layout, ol, 5);
+    ol.games[1] = 999;
+    CHECK(rejects(other_layout, ol, 1));
+    NTupleNetwork missing(1, 0, {});         // the part's own stage was never created
+    TrainingState mt;
+    missing.Load(base_path, mt);
+    missing.DropStage(2);
+    mt.games[2] = 999;
+    CHECK(rejects(missing, mt, 2));
+    bool twice = false;
+    try { MergeFiles(base_path, {{1, p1}, {1, p1}}, out, log); } catch (const std::invalid_argument &) { twice = true; }
+    CHECK(twice && !std::ifstream(out));
+    std::remove(bad.c_str());
+    for (const std::string &p : {base_path, p1, p2, out}) std::remove(p.c_str());
+}
+
+static void TestStartPositionsUnique() {
+    std::string path = TmpPath("sixteen-boards-unique.bin");
+    std::remove(path.c_str());
+    // a file written before the check: board 7 three times (different scores), board 9 twice
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write("SXBOARDS", 8);
+        uint32_t stage = 2;
+        out.write(reinterpret_cast<const char *>(&stage), 4);
+        std::vector<std::pair<board_t, float>> recs = {{7, 1}, {9, 2}, {7, 3}, {11, 4}, {9, 5}, {7, 6}};
+        for (auto &r : recs) {
+            out.write(reinterpret_cast<const char *>(&r.first), 8);
+            out.write(reinterpret_cast<const char *>(&r.second), 4);
+        }
+        out.write("xyz", 3); // torn trailing record
+    }
+    CHECK(StartPositions::Count(path) == 6);
+    {
+        StartPositions::Writer w(path, 2);
+        CHECK(w.count() == 3 && w.dropped() == 3);
+        CHECK(!w.Add(9, 10) && !w.Add(11, 11)); // already there
+        CHECK(w.Add(13, 12) && w.count() == 4);
+        CHECK(!w.Add(13, 14) && w.repeats() == 3 && w.count() == 4);
+    }
+    int stage = -1;
+    std::vector<StartPosition> got = StartPositions::Load(path, stage);
+    CHECK(stage == 2 && got.size() == 4 && StartPositions::Count(path) == 4);
+    // first copy of each board kept, in file order, with its own score
+    CHECK(got.size() == 4 && got[0].board == 7 && got[0].score == 1 && got[1].board == 9 && got[1].score == 2 &&
+          got[2].board == 11 && got[2].score == 4 && got[3].board == 13 && got[3].score == 12);
+    {
+        StartPositions::Writer w(path, 2); // reopening a clean file changes nothing
+        CHECK(w.count() == 4 && w.dropped() == 0 && !w.Add(7, 1));
+    }
+    CHECK(StartPositions::Count(path) == 4);
+    bool threw = false;
+    try { StartPositions::Writer w(path, 3); } catch (const std::runtime_error &) { threw = true; }
+    CHECK(threw);
+    std::remove(path.c_str());
+}
+
 int main() {
     InitLookUpTables();
     TestGenericValue();
@@ -1094,6 +1256,8 @@ int main() {
     TestCheckpoint();
     TestUpgradeTile();
     TestHardStarts();
+    TestMerge();
+    TestStartPositionsUnique();
     if (failures) {
         std::printf("%d check(s) failed\n", failures);
         return 1;

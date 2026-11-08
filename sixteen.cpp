@@ -8,6 +8,8 @@
  *   hard starts (--learn): --hard=P starts a share P of games from boards rewound 1..--hard-rewind=N
  *   (500) slides before the end of earlier games, kept while still in the active stage (pool of
  *   --hard-pool=N, 100000); --upgrade=Q doubles a tile of a start board with probability Q (HardStarts.h)
+ * Merge stages trained in separate sessions (Merge.h):
+ *   ./sixteen --merge=out.ckpt base.ckpt 1=s1.ckpt 4=s4.ckpt
  *   common: --threads=N --total=N --block=N --save-every=N --time-limit=SEC --collect-count=N --summary
  * Evaluate:  ./sixteen --total=1000 --seed=1 --summary --play="load=w.ckpt ply=3"
  *   --seed=N: game i uses environment seed N+i, so every checkpoint plays the same games whatever
@@ -40,6 +42,7 @@
 #include "Board64.h"
 #include "Episode.h"
 #include "HardStarts.h"
+#include "Merge.h"
 #include "StartPositions.h"
 #include "arena.h"
 #include "io.h"
@@ -350,7 +353,32 @@ int PrintCheckpointInfo(const std::string &path) {
     return 0;
 }
 
+// --merge=<out> <base> <k>=<ckpt> ...: base with stage k from each part (Merge.h)
+int MergeCheckpoints(int argc, const char *argv[]) {
+    std::string out, base_path;
+    std::vector<std::pair<int, std::string>> parts;
+    for (int i = 1; i < argc; i++) {
+        std::string para(argv[i]);
+        size_t eq = para.find('=');
+        if (para.find("--merge=") == 0) out = para.substr(8);
+        else if (para.find("--") == 0) throw std::invalid_argument("--merge takes no other option: " + para);
+        else if (eq == std::string::npos) {
+            if (!base_path.empty()) throw std::invalid_argument("--merge takes one base checkpoint");
+            base_path = para;
+        } else {
+            parts.emplace_back(std::stoi(para.substr(0, eq)), para.substr(eq + 1));
+        }
+    }
+    if (out.empty() || base_path.empty() || parts.empty())
+        throw std::invalid_argument("usage: --merge=<out> <base.ckpt> <stage>=<ckpt> [<stage>=<ckpt> ...]");
+    MergeFiles(base_path, parts, out, std::cerr);
+    return PrintCheckpointInfo(out);
+}
+
 int run(int argc, const char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]).find("--merge=") == 0) return MergeCheckpoints(argc, argv);
+    }
     size_t total = 1000;
     size_t block = 0;
     size_t save_every = 0;
@@ -457,7 +485,9 @@ int run(int argc, const char *argv[]) {
         if (active + 1 >= learner->NumStages()) throw std::invalid_argument("the active stage is the last one, nothing to collect");
         collector.reset(new StartPositions::Writer(collect_path, active + 1));
         std::cerr << "collecting boards for stage " << active + 1 << " into " << collect_path << " ("
-                  << collector->count() << "/" << collect_count << " present)" << std::endl;
+                  << collector->count() << "/" << collect_count << " distinct boards present";
+        if (collector->dropped()) std::cerr << ", " << collector->dropped() << " repeated boards removed from the file";
+        std::cerr << ")" << std::endl;
     }
     auto collection_done = [&]() {
         if (!collector) return false;
@@ -585,7 +615,8 @@ int run(int argc, const char *argv[]) {
 
     if (stop_requested) std::cerr << "stop requested after " << claimed.load() << " games" << std::endl;
     if (out_of_time) std::cerr << "time limit reached after " << claimed.load() << " games" << std::endl;
-    if (collector) std::cerr << "collected " << collector->count() << " boards" << std::endl;
+    if (collector) std::cerr << "collected " << collector->count() << " distinct boards (" << collector->repeats()
+                             << " repeats of boards already collected skipped)" << std::endl;
     if (hard > 0) std::cerr << "hard starts: " << hard_starts.Offered() << " boards offered to the pool" << std::endl;
 
     if (learning) learner->Save();
