@@ -8,6 +8,8 @@
 #               memory bandwidth, so move times measured with more threads run slow
 #   -p plies    expectimax plies to try (default "1 2")
 #   -x args     extra --play args for every run, e.g. -x "downgrade=32768" or -x "time=50"
+#   -r dir      save every game that reached -R tile (default 32768) move by move, one file per run:
+#               dir/<ckpt>-ply<p>.txt (format: RecordGame in sixteen.cpp)
 #
 # Prints one row per (checkpoint, ply): mean score with 95% interval, reach rates of 8192 /
 # 16384 / 32768 with 95% intervals, and the average / max time per move. Then, per run, the full
@@ -16,19 +18,22 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-games=1000 seed=1 threads=1 plies="1 2" extra=""
-while getopts "n:s:t:p:x:" opt; do
+games=1000 seed=1 threads=1 plies="1 2" extra="" record="" record_tile=32768
+while getopts "n:s:t:p:x:r:R:" opt; do
   case $opt in
     n) games=$OPTARG ;;
     s) seed=$OPTARG ;;
     t) threads=$OPTARG ;;
     p) plies=$OPTARG ;;
     x) extra=$OPTARG ;;
-    *) sed -n '2,14p' "$0"; exit 1 ;;
+    r) record=$OPTARG ;;
+    R) record_tile=$OPTARG ;;
+    *) sed -n '2,16p' "$0"; exit 1 ;;
   esac
 done
 shift $((OPTIND - 1))
-[ $# -ge 1 ] || { sed -n '2,15p' "$0"; exit 1; }
+[ $# -ge 1 ] || { sed -n '2,17p' "$0"; exit 1; }
+[ -z "$record" ] || mkdir -p "$record"
 
 make -s sixteen
 
@@ -78,7 +83,9 @@ details=""
 printf "%-28s %3s %18s %22s %22s %22s %9s %9s %6s %7s\n" checkpoint ply "mean ± ci95" "8192 %" "16384 %" "32768 %" "move_us" "max_ms" "over" "avg_ply"
 for ckpt in "$@"; do
   for ply in $plies; do
-    line=$(./sixteen --threads="$threads" --total="$games" --seed="$seed" --summary --block="$step" \
+    rec=()
+    [ -z "$record" ] || rec=(--record="$record/$(basename "$ckpt" .ckpt)-ply$ply.txt" --record-tile="$record_tile")
+    line=$(./sixteen --threads="$threads" --total="$games" --seed="$seed" --summary --block="$step" "${rec[@]}" \
              --play="load=$ckpt ply=$ply $extra" 2>/dev/null |
            progress "$games" "$(basename "$ckpt") ply=$ply${extra:+ $extra}" | grep '^eval:')
     get() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<< "$line"; }

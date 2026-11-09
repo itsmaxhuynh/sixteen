@@ -11,6 +11,7 @@
 #   MERGE: evaluate one checkpoint merged from stages trained separately instead (./sixteen --merge),
 #          "<base kernel> <stage>=<kernel> ...", e.g. MERGE="sixteen-x5 1=sixteen-x5s1 4=sixteen-x5s4";
 #          its kernels are the sources, so no kernel arguments are needed
+#   RECORD: tile; save every game reaching it (eval.sh -r) as games/<ckpt>-ply<p>.txt.gz in the output
 # Results: kaggle kernels output <user>/$NAME -p <dir> (eval.txt), or the live log.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,7 +31,7 @@ if [ -n "${MERGE:-}" ]; then
   [ -n "$parts" ] || { echo "MERGE: no <stage>=<kernel> parts" >&2; exit 1; }
   merge="{'base': '${words[0]}', 'parts': [${parts%, }]}"
 fi
-[ $# -ge 1 ] || { sed -n '2,13p' "$0"; exit 1; }
+[ $# -ge 1 ] || { sed -n '2,14p' "$0"; exit 1; }
 name="${NAME:-sixteen-eval}"
 out="kaggle/build-${name#sixteen-}"
 mkdir -p "$out"
@@ -38,7 +39,7 @@ mkdir -p "$out"
 sources=$(tar czf - makefile *.h sixteen.cpp eval.sh | base64 -w0)
 plies=$(python3 -c "import sys; print([int(p) for p in sys.argv[1].split()])" "${PLIES:-1 2 3}")
 runs=$(python3 -c "import sys; print([(int(p), x, int(g)) for p, x, g in (r.split(':') for r in sys.argv[1].split(';') if r)])" "${RUNS:-}")
-config="{'runs': $runs, 'plies': $plies, 'games': ${GAMES:-1000}, 'seed': ${SEED:-1}, 'threads': ${THREADS:-1}, 'extra': '${EXTRA:-}', 'merge': $merge}"
+config="{'runs': $runs, 'plies': $plies, 'games': ${GAMES:-1000}, 'seed': ${SEED:-1}, 'threads': ${THREADS:-1}, 'extra': '${EXTRA:-}', 'merge': $merge, 'record': ${RECORD:-0}}"
 python3 - "$sources" "$config" > "$out/eval.py" <<'EOF'
 import sys
 tpl = open("kaggle/eval_template.py").read()

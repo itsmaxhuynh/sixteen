@@ -15,6 +15,8 @@
  *   --seed=N: game i uses environment seed N+i, so every checkpoint plays the same games whatever
  *   the thread count; --summary then adds an "eval:" line with 95% intervals and move times
  *   (--move-limit-ms=100 sets the threshold counted as over the limit). See eval.sh.
+ *   --record=games.txt [--record-tile=32768]: write every game that reaches the tile, move by move
+ *   (RecordGame below has the format); not with --learn
  * Inspect:   ./sixteen --info=w.ckpt
  * Match:     --play="load=w.ckpt time=50"  iterative deepening within 50 ms per move (see Agent.h)
  * Arena:     ./sixteen --shell --name=<account> --play="load=w.ckpt ply=3"
@@ -51,6 +53,37 @@ static std::atomic<bool> stop_requested{false};
 static_assert(std::atomic<bool>::is_always_lock_free, "the signal handler needs a lock-free flag");
 
 static void RequestStop(int) { stop_requested = true; }
+
+// One block per game: a header line, the start board, then one line per move (slides and tile
+// placements alternate):
+//   game <index> seed <env seed or -1> score <final> max <largest tile> moves <n>
+//   start <board>
+//   <step> <move> <reward> <score> <board after the move>
+// move is U/R/D/L for a slide or 2@<cell>/4@<cell> for a placed tile (cells 0..15 row by row from the
+// top left); board is 16 hex digits, one per cell in the same order, digit r = tile 2^r (0 = empty).
+static void RecordGame(std::ostream &out, const Episode &game, uint64_t index, long seed) {
+    auto hex = [](board_t b) {
+        std::string s(16, '0');
+        for (int i = 0; i < 16; ++i) s[i] = "0123456789abcdef"[(b >> (4 * i)) & 0xf];
+        return s;
+    };
+    const auto &moves = game.GetMoves();
+    out << "game " << index << " seed " << seed << " score " << game.score() << " max "
+        << (1u << Board64(game.state()).GetMaxTile()) << " moves " << moves.size() << "\n";
+    out << "start " << hex(game.StartBoard()) << "\n";
+    reward_t score = game.score();
+    for (const auto &m : moves) score -= m.reward;
+    for (size_t i = 0; i < moves.size(); ++i) {
+        const Action &a = moves[i].code;
+        score += moves[i].reward;
+        out << i << ' ';
+        if (a.type() == Action::Slide::type_) out << "URDL"[a.event() & 3];
+        else { Action::Place p(a); out << (1u << p.tile()) << '@' << p.position(); }
+        out << ' ' << moves[i].reward << ' ' << score << ' ' << hex(moves[i].board) << "\n";
+    }
+    out << "\n";
+    out.flush();
+}
 
 int shell(int argc, const char *argv[]) {
     arena host("anonymous");
@@ -398,6 +431,8 @@ int run(int argc, const char *argv[]) {
     std::string evil_args;
     std::string start_path;
     std::string collect_path;
+    std::string record_path;
+    unsigned record_tile = 32768;
 
     for (int i = 1; i < argc; i++) {
         std::string para(argv[i]);
@@ -439,6 +474,10 @@ int run(int argc, const char *argv[]) {
             hard_pool = std::stoull(value);
         } else if (para.find("--upgrade=") == 0) {
             upgrade = std::stod(value);
+        } else if (para.find("--record=") == 0) {
+            record_path = value;
+        } else if (para.find("--record-tile=") == 0) {
+            record_tile = unsigned(std::stoul(value));
         } else if (para.find("--summary") == 0) {
             summary = true;
         } else if (para.find("--shell") == 0) {
@@ -452,6 +491,7 @@ int run(int argc, const char *argv[]) {
     if ((hard > 0 || upgrade > 0) && !learning) throw std::invalid_argument("--hard and --upgrade are for --learn");
     if (hard < 0 || hard > 1 || upgrade < 0 || upgrade > 1) throw std::invalid_argument("--hard and --upgrade are probabilities");
     if (hard > 0 && (hard_rewind < 1 || hard_pool < 1)) throw std::invalid_argument("--hard-rewind and --hard-pool must be >= 1");
+    if (record_path.size() && learning) throw std::invalid_argument("--record is for evaluation, not --learn");
     if (!block) block = total;
 
     // one shared learner (Hogwild), one player and environment per thread
@@ -489,6 +529,14 @@ int run(int argc, const char *argv[]) {
         if (collector->dropped()) std::cerr << ", " << collector->dropped() << " repeated boards removed from the file";
         std::cerr << ")" << std::endl;
     }
+    std::ofstream record;
+    std::mutex record_mutex;
+    if (record_path.size()) {
+        record.open(record_path);
+        if (!record) throw std::invalid_argument("cannot write " + record_path);
+        std::cerr << "recording games that reach " << record_tile << " into " << record_path << std::endl;
+    }
+
     auto collection_done = [&]() {
         if (!collector) return false;
         std::lock_guard<std::mutex> lock(collector_mutex);
@@ -592,6 +640,10 @@ int run(int argc, const char *argv[]) {
             if (learning) learner->Learn(game);
             if (!learning) reporter.AddMoveTimes(move_time, move_time_max, over_limit, player.TakeMoveStats());
             reporter.Add(game, kind);
+            if (record.is_open() && (1u << game.state().GetMaxTile()) >= record_tile) {
+                std::lock_guard<std::mutex> lock(record_mutex);
+                RecordGame(record, game, n, seeded ? long(seed + unsigned(n)) : -1L);
+            }
             if (hard > 0 && kind == Reporter::kNormal) hard_starts.Offer(game, active, split, hard_rng);
 
             if (time_limit > 0) {

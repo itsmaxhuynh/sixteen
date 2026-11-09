@@ -57,6 +57,9 @@ with open(os.path.join(WORK, "eval.txt"), "w") as out, open(os.path.join(WORK, "
                     "-t", str(CONFIG["threads"]), "-p", str(ply)]
             if extra:
                 args += ["-x", extra]
+            # CONFIG 'record' = tile: keep every game reaching it, gzipped in games/ (eval.sh -r)
+            if CONFIG.get("record"):
+                args += ["-r", os.path.join(WORK, "games"), "-R", str(CONFIG["record"])]
             # stderr (eval.sh progress lines) goes straight to the log, so the live log shows how far a run is
             res = subprocess.run(args + [path], stdout=subprocess.PIPE, text=True, check=True)
             lines = res.stdout.strip().splitlines()
@@ -73,4 +76,8 @@ with open(os.path.join(WORK, "eval.txt"), "w") as out, open(os.path.join(WORK, "
             detail_out.write(detail + "\n\n")
             detail_out.flush()
             print(header + "\n" + row + "\n\n" + detail, flush=True)
+if CONFIG.get("record"):
+    for f in glob.glob(os.path.join(WORK, "games", "*.txt")):
+        subprocess.run(["gzip", "-f", f], check=True)
+        log(f"recorded games: {f}.gz")
 log("done")
