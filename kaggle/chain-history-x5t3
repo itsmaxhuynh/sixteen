@@ -1,1 +1,2 @@
 2026-11-09 09:15 UTC PUSH #1 (manual, SEED=sixteen-x5s3 MIN_GAMES=60000000): stage 3 only, 20M -> 30M, cosine restart 0.00025 -> 2.5e-05
+2026-11-09 20:06 UTC DONE: all stages trained, stages=5 active=3 features=31 alpha=0.00025 lambda=0.5 games=10000000,10000000,10000000,30000000,10000000 initialized=1,1,1,1,1
