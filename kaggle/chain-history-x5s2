@@ -1,2 +1,3 @@
 2026-11-08 11:28 UTC PUSH #1 (manual, SEED=sixteen-x5 MIN_GAMES=50000000): stage 2 only, from x5 final (10M each)
 2026-11-08 22:26 UTC PUSH #2: from games=57643058 (10000000,10000000,17643058,10000000,10000000) boards=400000
+2026-11-09 09:38 UTC DONE: all stages trained, stages=5 active=2 features=31 alpha=0.00025 lambda=0.5 games=10000000,10000000,20000000,10000000,10000000 initialized=1,1,1,1,1
