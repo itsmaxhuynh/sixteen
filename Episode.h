@@ -8,6 +8,7 @@
 
 #include "Action.h"
 #include "Board64.h"
+#include "WideBoard.h"
 
 class Agent;
 
@@ -64,6 +65,7 @@ public:
     void CloseEpisode(const std::string &tag) { ep_close = {tag, millisec()}; }
 
     bool ApplyAction(Action move) {
+        if (wide_on_) return ApplyWide(move);
         reward_t reward = move.Apply(state());
         if (reward == -1) return false;
         ep_moves.emplace_back(state().GetBoard(), move, reward, millisec() - ep_time);
@@ -77,7 +79,27 @@ public:
         ep_score = score;
         start_board_ = board;
         first_slide_ = 0;
+        if (wide_on_) wide_ = WideBoard::From(board);
     }
+
+    /**
+     * Wide mode (off by default, so nothing changes without it): the real board is a WideBoard,
+     * which merges two 32768s into 65536, and moves and placements apply to it; state() is then
+     * Fit(real board), the Board64 that agents see and search, and GetMoves() keeps those boards.
+     * Call before the first move (after Start).
+     */
+    void UseWideBoard() {
+        wide_on_ = true;
+        wide_ = WideBoard::From(ep_state.GetBoard());
+        wide_moves_.clear();
+    }
+
+    bool Wide() const { return wide_on_; }
+
+    const WideBoard &WideState() const { return wide_; }
+
+    // wide mode: the real board after each move of GetMoves()
+    const std::vector<WideBoard> &WideMoves() const { return wide_moves_; }
 
     board_t StartBoard() const { return start_board_; }
 
@@ -137,6 +159,24 @@ public:
     }
 
 protected:
+    bool ApplyWide(Action move) {
+        long reward;
+        if (move.type() == Action::Slide::type_) {
+            reward = wide_.Slide(move.event() & 3);
+        } else if (move.type() == Action::Place::type_) {
+            Action::Place p(move);
+            reward = wide_.Place(p.position(), p.tile());
+        } else {
+            return false;
+        }
+        if (reward == -1) return false;
+        ep_state = Board64(Fit(wide_));
+        ep_moves.emplace_back(ep_state.GetBoard(), move, reward_t(reward), millisec() - ep_time);
+        wide_moves_.push_back(wide_);
+        ep_score += reward_t(reward);
+        return true;
+    }
+
     struct Meta {
         std::string tag;
         time_t when;
@@ -167,4 +207,8 @@ private:
     Meta ep_close;
     board_t start_board_ = 0;
     size_t first_slide_ = 2;
+
+    bool wide_on_ = false;
+    WideBoard wide_;
+    std::vector<WideBoard> wide_moves_;
 };

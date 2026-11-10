@@ -65,12 +65,17 @@ the cached search returns exactly what plain expectimax would. `prune=p` (off by
 searching spawn outcomes whose path probability is below p.
 
 `downgrade=32768` adds tile-downgrading at the root (Guei et al., arXiv:2111.11090, Sec. IV.C.3):
-once the largest tile is 32768 and some tile r >= 8 below it is missing (the largest such r), every
-tile above r is halved and the move is searched on that board, valued with its own stage. Halving
-keeps empties and equal neighbours, so the move does the same merges on the real board, and the
-halved large tiles are ones the network trained on far more often. Skipped with two 32768 tiles,
-which merge only on the halved board. The paper's ablation credits it with 587k -> 625k mean at
-6-ply; `downgraded_moves=` in the `eval:` line counts the moves it changed the board for.
+once the largest tile is 32768 and some tile r below it is missing (the largest such r, down to the
+2-tile), every tile above r is halved and the move is searched on that board, valued with its own
+stage. Halving keeps empties and equal neighbours, so the move does the same merges on the real
+board, and the halved large tiles are ones the network trained on far more often. Skipped with two
+32768 tiles on a Board64 game, which merge only on the halved board. The paper's ablation credits it
+with 587k -> 625k mean at 6-ply; `downgraded_moves=` in the `eval:` line counts the moves it changed
+the board for. Going down to the 2-tile matters on the stretch just before a second 32768, when every
+tile from 8 to 16384 is on the board: stopping at 8 there left the network valuing a raw 32768 board
+(values near 0), and from the full 32768..8 snake only 10 of 20 games built the second 32768 instead
+of 20 of 20. It changes nothing on boards that miss a tile of 8 or more (identical on the 9 deepest
+recorded games, 260k moves).
 
 Root downgrading has a flaw inside the search: once a merge builds the missing tile r, the new real
 r sits beside halved tiles that show as r but are twice as big, and the search merges them (phantom
@@ -79,6 +84,25 @@ the real board and downgrades each leaf on its own just before the network value
 stage, so every merge in the tree is real. Rewards along the path are then real points while leaf
 values are on the halved scale. It costs about 40% more per move on 32768 boards (still far below
 100 ms) and changed 0.2% of endgame moves; 100 paired games gave +2.3k (534k -> 537k).
+
+## 65536 (TAAI merges two 32768s)
+
+Board64's 4-bit cells stop at 32768, so a game is kept on a `WideBoard` (`WideBoard.h`, one byte per
+cell, same rules without the cap) wherever it is the real game: always in an arena match, and in
+evaluation with `--wide`. Agents never see it: they get `Fit()` of it, which leaves a board that fits
+unchanged and otherwise closes the largest missing rank until it does (two 32768s become two 16384s,
+which Board64 merges; a 65536 becomes 32768, then root downgrading takes it to 16384). Closing a
+missing rank keeps empties, equal tiles and their order, so every move is legal on both boards and
+does the same slides and merges; the network, checkpoint, search and training are unchanged. Without
+two 32768s on the board, `--wide` plays bit-identical games.
+
+```sh
+# from the full 32768..4 snake: 20/20 games reach 65536 (r65536= in the eval line), mean 1.21M
+./sixteen --wide --start=snake.bin --total=20 --seed=1 --summary --record=wide.txt --play="<eval args>"
+```
+
+`--record` writes a wide game's real boards with base-32 digits (65536 is `g`); `--explain` and the
+replay viewer read them.
 
 ## Inspecting moves
 
@@ -159,6 +183,6 @@ x4b's hard starts and tile-upgrading, 10M games per stage like main, cosine alph
 
 ## Known limits
 
-* 4-bit cells stop at 32768: two 32768 tiles do not merge, so 65536 cannot be built yet. If the
-  real game merges them, our board copy in a match would drift from the real one.
+* Without `--wide`, evaluation games stop at two 32768s (Board64 does not merge them); local evals
+  never got there (no game in 1000 held two), so their scores are not capped in practice.
 * The arena shell keeps the CGI protocol from the Threes project; the TAAI protocol is unchecked.

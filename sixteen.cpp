@@ -17,6 +17,8 @@
  *   (--move-limit-ms=100 sets the threshold counted as over the limit). See eval.sh.
  *   --record=games.txt [--record-tile=32768]: write every game that reaches the tile, move by move
  *   (RecordGame below has the format); not with --learn
+ *   --wide: keep each game on a WideBoard, where two 32768s merge into 65536 as in TAAI (agents see
+ *   Fit() of it, WideBoard.h); the eval line then adds r65536=, the games that reached 65536
  * Explain:   zcat games.txt.gz | ./sixteen --explain=- --explain-out=x.txt --explain-game=893 --play="<eval args>"
  *   each recorded slide with the value of every move (ExplainGames below)
  * Inspect:   ./sixteen --info=w.ckpt
@@ -65,14 +67,14 @@ static void RequestStop(int) { stop_requested = true; }
 // move is U/R/D/L for a slide or 2@<cell>/4@<cell> for a placed tile (cells 0..15 row by row from the
 // top left); board is 16 hex digits, one per cell in the same order, digit r = tile 2^r (0 = empty).
 static void RecordGame(std::ostream &out, const Episode &game, uint64_t index, long seed) {
-    auto hex = [](board_t b) {
-        std::string s(16, '0');
-        for (int i = 0; i < 16; ++i) s[i] = "0123456789abcdef"[(b >> (4 * i)) & 0xf];
-        return s;
-    };
+    auto hex = [](board_t b) { return WideBoard::From(b).Hex(); };
     const auto &moves = game.GetMoves();
-    out << "game " << index << " seed " << seed << " score " << game.score() << " max "
-        << (1u << Board64(game.state()).GetMaxTile()) << " moves " << moves.size() << "\n";
+    // a wide game records its real boards (base-32 digits: 65536 is 'g')
+    auto board = [&](size_t i) { return game.Wide() ? game.WideMoves()[i].Hex() : hex(moves[i].board); };
+    int top = game.Wide() ? game.WideState().MaxRank() : Board64(game.state()).GetMaxTile();
+    // scores as integers: a float prints 1149550 as 1.14955e+06 (rewards are whole numbers)
+    out << "game " << index << " seed " << seed << " score " << (long long)(game.score()) << " max "
+        << (1ul << top) << " moves " << moves.size() << "\n";
     out << "start " << hex(game.StartBoard()) << "\n";
     reward_t score = game.score();
     for (const auto &m : moves) score -= m.reward;
@@ -82,7 +84,7 @@ static void RecordGame(std::ostream &out, const Episode &game, uint64_t index, l
         out << i << ' ';
         if (a.type() == Action::Slide::type_) out << "URDL"[a.event() & 3];
         else { Action::Place p(a); out << (1u << p.tile()) << '@' << p.position(); }
-        out << ' ' << moves[i].reward << ' ' << score << ' ' << hex(moves[i].board) << "\n";
+        out << ' ' << (long long)(moves[i].reward) << ' ' << (long long)(score) << ' ' << board(i) << "\n";
     }
     out << "\n";
     out.flush();
@@ -195,6 +197,10 @@ public:
     void Add(const Episode &game, Start start = kNormal) {
         int split = MaxSplit(game);
         std::lock_guard<std::mutex> lock(mutex_);
+        if (game.Wide()) {
+            wide_games_++;
+            wide_65536_ += game.WideState().MaxRank() >= 16;
+        }
         all_games_++;
         all_moves_ += game.step(Action::Slide::type_);
         if (start != kNormal) {
@@ -258,6 +264,7 @@ public:
         }
         if (ply_moves_) out << std::setprecision(2) << " avg_ply=" << double(ply_sum_) / double(ply_moves_);
         if (downgraded_) out << " downgraded_moves=" << downgraded_;
+        if (wide_games_) out << " r65536=" << wide_65536_ << "/" << wide_games_;
         // the full breakdown (eval.sh prints it as a table): reach rate of every tile from 2 to 32768
         // (games whose largest tile got at least that far), then of the stage splits
         // ([MS-TD] T_16k, T_16+8k, T_16+8+4k, T_16+8+4+2k: the boards where stages 1..4 take over)
@@ -372,6 +379,7 @@ private:
     double move_time_ = 0, move_time_max_ = 0;
     size_t moves_over_limit_ = 0;
     uint64_t ply_sum_ = 0, ply_moves_ = 0, downgraded_ = 0;
+    uint64_t wide_games_ = 0, wide_65536_ = 0; // games kept on a WideBoard (--wide), those reaching 65536
     Clock::time_point start_, block_start_;
 };
 
@@ -453,10 +461,11 @@ int ExplainGames(int argc, const char *argv[]) {
     if (!out) throw std::invalid_argument("cannot write " + part_path);
 
     TdPlayer player(play_args);
+    // base-32 digits, so --wide records (65536 = 'g') load too; the agent sees Fit() of the board
     auto parse = [](const std::string &hex) {
         if (hex.size() != 16) throw std::invalid_argument("bad board: " + hex);
-        board_t b = 0;
-        for (int i = 0; i < 16; ++i) b |= board_t(std::stoi(hex.substr(i, 1), nullptr, 16)) << (4 * i);
+        WideBoard b;
+        for (int i = 0; i < 16; ++i) b.cell[i] = uint8_t(std::stoi(hex.substr(i, 1), nullptr, 32));
         return b;
     };
     auto list = [](const float v[4]) {
@@ -473,7 +482,7 @@ int ExplainGames(int argc, const char *argv[]) {
     std::string line;
     bool keep = false;
     long game = -1;
-    board_t board = 0;
+    WideBoard board;
     size_t explained = 0, differ = 0, games = 0, over_100 = 0;
     double slowest_ms = 0;
     long slowest_game = -1, slowest_step = -1;
@@ -497,14 +506,14 @@ int ExplainGames(int argc, const char *argv[]) {
             long step = std::stol(first);
             std::string move, reward, score, hex;
             fields >> move >> reward >> score >> hex;
-            board_t after = parse(hex);
+            WideBoard after = parse(hex);
             int slide = std::string("URDL").find(move);
             if (move.size() == 1 && slide >= 0) {
                 if (step < from) {
-                    player.Observe(Board64(board));
+                    player.Observe(Board64(Fit(board)));
                 } else {
                     auto t0 = std::chrono::steady_clock::now();
-                    TdPlayer::Explanation e = player.Explain(Board64(board));
+                    TdPlayer::Explanation e = player.Explain(Board64(Fit(board)));
                     double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
                     if (ms > slowest_ms) { slowest_ms = ms; slowest_game = game; slowest_step = step; }
                     over_100 += ms > 100;
@@ -695,6 +704,7 @@ int run(int argc, const char *argv[]) {
     double time_limit = 0;
     bool learning = false;
     bool summary = false;
+    bool wide = false;
     bool seeded = false;
     unsigned seed = 0;
     double move_limit_ms = 100;
@@ -755,6 +765,8 @@ int run(int argc, const char *argv[]) {
             record_tile = unsigned(std::stoul(value));
         } else if (para.find("--summary") == 0) {
             summary = true;
+        } else if (para == "--wide") {
+            wide = true;
         } else if (para.find("--shell") == 0) {
             return shell(argc, argv);
         } else {
@@ -767,6 +779,7 @@ int run(int argc, const char *argv[]) {
     if (hard < 0 || hard > 1 || upgrade < 0 || upgrade > 1) throw std::invalid_argument("--hard and --upgrade are probabilities");
     if (hard > 0 && (hard_rewind < 1 || hard_pool < 1)) throw std::invalid_argument("--hard-rewind and --hard-pool must be >= 1");
     if (record_path.size() && learning) throw std::invalid_argument("--record is for evaluation, not --learn");
+    if (wide && learning) throw std::invalid_argument("--wide is for evaluation, not --learn");
     if (!block) block = total;
 
     // one shared learner (Hogwild), one player and environment per thread
@@ -886,6 +899,7 @@ int run(int argc, const char *argv[]) {
                     kind = Reporter::kUpgraded;
                 }
             }
+            if (wide) game.UseWideBoard();
             player.OpenEpisode();
             evil.OpenEpisode();
 
@@ -915,7 +929,8 @@ int run(int argc, const char *argv[]) {
             if (learning) learner->Learn(game);
             if (!learning) reporter.AddMoveTimes(move_time, move_time_max, over_limit, player.TakeMoveStats());
             reporter.Add(game, kind);
-            if (record.is_open() && (1u << game.state().GetMaxTile()) >= record_tile) {
+            int top = wide ? game.WideState().MaxRank() : game.state().GetMaxTile();
+            if (record.is_open() && (1ul << top) >= record_tile) {
                 std::lock_guard<std::mutex> lock(record_mutex);
                 RecordGame(record, game, n, seeded ? long(seed + unsigned(n)) : -1L);
             }

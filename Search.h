@@ -17,10 +17,14 @@
  * neighbours are equal), so a move chosen on it is legal and does the same merges on the real
  * board, while its large tiles are ones the network has seen far more often in training.
  *
- * r is the largest missing rank, as in the paper's example. We also require r >= 3 (8-tile), our
- * choice: then 2- and 4-tiles keep their meaning, so the spawns inside the search stay exact.
+ * r is the largest missing rank, as in the paper's example, down to r = 1 (the 2-tile). Once every
+ * tile from 8 to 16384 is on the board (the stretch just before a second 32768), r is 2 or 1 and the
+ * spawns inside the search are then slightly off (a spawned 2 or 4 sits beside halved tiles that
+ * look the same), but without downgrading the network values a raw 32768 board and plays blind there:
+ * from the full 32768..8 snake it built the second 32768 in 10 of 20 games, 20 of 20 with r >= 1.
  * Also skipped with two or more MAX_RANK tiles: they cannot merge on our board (4-bit cells) but
  * would after halving, so a move could be legal on the downgraded board and illegal on the real one.
+ * (Games kept on a WideBoard never show two: Fit in WideBoard.h halves them first, so they merge.)
  * Returns b unchanged when the conditions do not hold.
  */
 inline board_t DowngradeRoot(board_t b, int min_rank) {
@@ -34,8 +38,8 @@ inline board_t DowngradeRoot(board_t b, int min_rank) {
     int top = 31 - __builtin_clz(present | 1);
     if (min_rank <= 0 || top < min_rank || n_max >= 2) return b;
     int r = top - 1;
-    while (r >= 3 && ((present >> r) & 1)) --r;
-    if (r < 3) return b;
+    while (r >= 1 && ((present >> r) & 1)) --r;
+    if (r < 1) return b;
     board_t out = b;
     for (int i = 0; i < 16; ++i) {
         if (int((b >> (4 * i)) & 0xf) > r) out -= board_t(1) << (4 * i); // rank k > r becomes k-1

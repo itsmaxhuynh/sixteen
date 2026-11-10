@@ -11,7 +11,10 @@ class arena {
 public:
     class match : public Episode {
     public:
-        match(const std::string& id, std::shared_ptr<Agent> play, std::shared_ptr<Agent> evil) : id(id), play(play), evil(evil) {}
+        // the real board is a WideBoard (TAAI merges two 32768s into 65536); agents see Fit() of it
+        match(const std::string& id, std::shared_ptr<Agent> play, std::shared_ptr<Agent> evil) : id(id), play(play), evil(evil) {
+            UseWideBoard();
+        }
         std::string name() const { return id; }
 
         Action take_action() {

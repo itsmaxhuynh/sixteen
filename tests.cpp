@@ -8,6 +8,7 @@
 #include <set>
 
 #include "Agent.h"
+#include "arena.h"
 #include "HardStarts.h"
 #include "Merge.h"
 #include "StartPositions.h"
@@ -730,7 +731,7 @@ static void TestAdaptivePly() {
 }
 
 // tile-downgrading written out on a grid: the rank r above which tiles halve (largest missing rank
-// with 3 <= r < top), or -1 when downgrading does not apply
+// with 1 <= r < top), or -1 when downgrading does not apply
 static int NaiveSkippedRank(board_t b, int min_rank) {
     int top = 0, n_max = 0;
     bool present[16] = {};
@@ -741,7 +742,7 @@ static int NaiveSkippedRank(board_t b, int min_rank) {
         n_max += x == 15;
     }
     if (top < min_rank || n_max >= 2) return -1;
-    for (int k = top - 1; k >= 3; --k) if (!present[k]) return k;
+    for (int k = top - 1; k >= 1; --k) if (!present[k]) return k;
     return -1;
 }
 
@@ -765,7 +766,12 @@ static void TestDowngrade() {
     CHECK(DowngradeRoot(no32k.GetBoard(), 14) == MakeBoard({13, 12, 11, 3}).GetBoard()); // lower threshold
     CHECK(DowngradeRoot(MakeBoard({15, 3, 1}).GetBoard(), 15) == MakeBoard({14, 3, 1}).GetBoard()); // r = 14
     Board64 full = MakeBoard({15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1});
-    CHECK(DowngradeRoot(full.GetBoard(), 15) == full.GetBoard());                    // only 2 or 4 missing
+    CHECK(DowngradeRoot(full.GetBoard(), 15) == full.GetBoard());                    // every tile 2..32768: none missing
+    // every tile from 8 to 16384 present (just before a second 32768): r = 1 (no 2-tile), all halve
+    Board64 snake = MakeBoard({15, 14, 13, 12, 8, 9, 10, 11, 7, 6, 5, 4, 0, 2, 2, 3});
+    CHECK(DowngradeRoot(snake.GetBoard(), 15) == MakeBoard({14, 13, 12, 11, 7, 8, 9, 10, 6, 5, 4, 3, 0, 1, 1, 2}).GetBoard());
+    Board64 no4 = MakeBoard({15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 1, 1, 0});
+    CHECK(DowngradeRoot(no4.GetBoard(), 15) == MakeBoard({14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 0}).GetBoard()); // r = 2
     Board64 two_max = MakeBoard({15, 15, 3});
     CHECK(DowngradeRoot(two_max.GetBoard(), 15) == two_max.GetBoard());              // 32768 pair: skipped
 
@@ -800,6 +806,134 @@ static void TestDowngrade() {
 
 // TdPlayer with downgrade=: the move is the plain player's move on the downgraded board, valued
 // with the stage of the downgraded board; boards it does not apply to are played as before
+// WideBoard: the same slides and rewards as Board64 wherever Board64 makes every merge (at most one
+// 32768), and 32768 + 32768 = 65536, which Board64 refuses
+static void TestWideBoard() {
+    std::mt19937_64 rng(5);
+    int bad = 0, compared = 0;
+    for (int trial = 0; trial < 100000; ++trial) {
+        Board64 b;
+        for (int i = 0; i < 16; ++i) b.Set(i, rng() % 3 == 0 ? 0 : int(rng() % (trial % 5 ? 6 : 16)));
+        WideBoard w0 = WideBoard::From(b.GetBoard());
+        if (!w0.Fits()) continue;
+        bad += Fit(w0) != b.GetBoard(); // fits: Fit changes nothing
+        for (int d = 0; d < 4; ++d) {
+            Board64 nb = b;
+            WideBoard w = w0;
+            reward_t r = nb.Slide(d);
+            long wr = w.Slide(d);
+            bad += long(r) != wr;
+            if (wr != -1) bad += !(WideBoard::From(nb.GetBoard()) == w);
+            compared++;
+        }
+    }
+    CHECK(compared > 300000 && bad == 0);
+
+    WideBoard pair = WideBoard::From(MakeBoard({15, 15, 0, 3}).GetBoard());
+    Board64 pair64 = MakeBoard({15, 15, 0, 3});
+    CHECK(pair64.Slide(3) == 0);                    // Board64 moves the 8 but cannot merge the pair
+    CHECK(pair.Slide(3) == 65536 && pair.cell[0] == 16 && pair.cell[1] == 3 && pair.MaxRank() == 16);
+    CHECK(pair.Hex() == "g300000000000000");
+    CHECK(pair.Place(1, 1) == -1 && pair.Place(2, 1) == 0 && pair.cell[2] == 1);
+}
+
+// Fit: unchanged when the board fits; otherwise the largest missing ranks closed until it does, which
+// keeps empties, equalities and order, so every move is legal on both and makes the same slides and
+// merges (the same cells end up empty). The boards after it need not match in shape: a merge can
+// build the rank that was closed, which then equals a lowered tile (a phantom merge, as inside the
+// search), so the game refits the real board after every move.
+static void TestFit() {
+    auto wide = [](std::initializer_list<int> ranks) {
+        WideBoard w;
+        int i = 0;
+        for (int r : ranks) w.cell[i++] = uint8_t(r);
+        return w;
+    };
+    auto narrow = [](std::initializer_list<int> ranks) { return MakeBoard(ranks).GetBoard(); };
+    CHECK(Fit(wide({15, 14, 3, 1})) == narrow({15, 14, 3, 1}));     // fits: unchanged
+    CHECK(Fit(wide({15, 15, 13, 1})) == narrow({14, 14, 13, 1}));   // pair of 32768s: 16384 missing
+    CHECK(Fit(wide({15, 15, 14, 13})) == narrow({14, 14, 13, 12})); // 8192 present, 4096 missing
+    CHECK(Fit(wide({16, 3, 1})) == narrow({15, 3, 1}));             // 65536 alone becomes 32768
+    CHECK(Fit(wide({16, 15, 3})) == narrow({15, 14, 3}));           // 65536 + 32768
+    CHECK(Fit(wide({17, 16, 16, 2})) == narrow({15, 14, 14, 2}));   // closes two ranks
+    // full board of every tile 2..16384 plus two 32768s: nothing to close, capped (and no hang)
+    CHECK(Fit(wide({15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1})) ==
+          narrow({15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1}));
+
+    // same structure: zero, equal and order relations between any two cells
+    auto same_shape = [](const WideBoard &w, board_t f) {
+        for (int i = 0; i < 16; ++i) {
+            int fi = int((f >> (4 * i)) & 0xf);
+            if ((w.cell[i] == 0) != (fi == 0)) return false;
+            for (int j = 0; j < 16; ++j) {
+                int fj = int((f >> (4 * j)) & 0xf);
+                if ((w.cell[i] == w.cell[j]) != (fi == fj) || (w.cell[i] < w.cell[j]) != (fi < fj)) return false;
+            }
+        }
+        return true;
+    };
+    std::mt19937_64 rng(11);
+    int fitted = 0, bad = 0;
+    for (int trial = 0; trial < 100000; ++trial) {
+        WideBoard w;
+        for (int i = 0; i < 16; ++i) w.cell[i] = uint8_t(rng() % 3 == 0 ? 0 : 10 + int(rng() % 8)); // 1024..131072
+        if (trial % 2) w.cell[rng() % 16] = 15, w.cell[rng() % 16] = 15;                       // 32768 pairs
+        board_t f = Fit(w);
+        if (WideBoard::From(f) == w) continue;
+        fitted++;
+        bad += !WideBoard::From(f).Fits() || !same_shape(w, f);
+        for (int d = 0; d < 4; ++d) {
+            WideBoard ws = w;
+            Board64 fs(f);
+            long wr = ws.Slide(d);
+            reward_t fr = fs.Slide(d);
+            bad += (wr == -1) != (fr == -1);
+            for (int i = 0; i < 16 && wr != -1; ++i) bad += (ws.cell[i] == 0) != (fs(i) == 0);
+        }
+    }
+    CHECK(fitted > 50000 && bad == 0);
+}
+
+// a game kept on a WideBoard: from the full 32768..4 snake, the cascade of 14 slides ends in 65536;
+// agents only ever see boards that fit, and the same game on Board64 stops at the last merge
+static void TestWideEpisode() {
+    board_t snake = MakeBoard({15, 14, 13, 12, 8, 9, 10, 11, 7, 6, 5, 4, 0, 0, 2, 3}).GetBoard();
+    const char *line = "RRURRLURRRURRR";
+    Episode wide, narrow;
+    wide.Start(snake, 0);
+    wide.UseWideBoard();
+    narrow.Start(snake, 0);
+    CHECK(wide.Wide() && !narrow.Wide());
+    CHECK(wide.ApplyAction(Action::Place(13, 2)) && narrow.ApplyAction(Action::Place(13, 2)));
+    bool fits = true, narrow_ok = true;
+    for (const char *c = line; *c; ++c) {
+        unsigned d = unsigned(std::string("URDL").find(*c));
+        CHECK(wide.ApplyAction(Action::Slide(d)));
+        fits = fits && WideBoard::From(wide.state().GetBoard()).Fits();
+        fits = fits && Fit(wide.WideState()) == wide.state().GetBoard();
+        bool ok = narrow.ApplyAction(Action::Slide(d));
+        if (c[1]) narrow_ok = narrow_ok && ok;
+        else CHECK(!ok);                                  // Board64: 32768 + 32768 refused
+    }
+    CHECK(fits && narrow_ok);
+    CHECK(wide.WideState().MaxRank() == 16 && wide.WideMoves().size() == 15);
+    CHECK(wide.WideMoves().back() == wide.WideState());
+    CHECK(wide.score() == 131064 && narrow.score() == 65528); // every merge of the cascade, 4+4 .. 32768+32768
+    CHECK(wide.state().GetBoard() == MakeBoard({0, 0, 0, 15}).GetBoard()); // agents see 65536 as 32768
+    CHECK(wide.GetMoves().back().board == wide.state().GetBoard());
+}
+
+// an arena match keeps the real board on a WideBoard: two 32768s placed by the server merge
+static void TestArenaWide() {
+    auto dummy = std::make_shared<Agent>("name=x role=dummy");
+    arena::match m("M1", dummy, dummy);
+    CHECK(m.Wide());
+    CHECK(m.ApplyAction(Action::Place(0, 15)) && m.ApplyAction(Action::Place(1, 15)));
+    CHECK(m.state().GetBoard() == MakeBoard({14, 14}).GetBoard()); // what the agent searches
+    CHECK(m.ApplyAction(Action::Slide(3)) && m.score() == 65536);
+    CHECK(m.WideState().cell[0] == 16 && m.state().GetBoard() == MakeBoard({15}).GetBoard());
+}
+
 static void TestDowngradePlayer() {
     std::vector<std::vector<int>> small = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}};
     NTupleNetwork net(5, kFeatAll, small);
@@ -1394,6 +1528,10 @@ int main() {
     TestCosineAnnealing();
     TestOptimisticInit();
     TestDowngrade();
+    TestWideBoard();
+    TestFit();
+    TestWideEpisode();
+    TestArenaWide();
     TestDowngradePlayer();
     TestExplain();
     TestSearchExact();
