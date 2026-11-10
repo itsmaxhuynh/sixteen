@@ -25,9 +25,13 @@
  * Also skipped with two or more MAX_RANK tiles: they cannot merge on our board (4-bit cells) but
  * would after halving, so a move could be legal on the downgraded board and illegal on the real one.
  * (Games kept on a WideBoard never show two: Fit in WideBoard.h halves them first, so they merge.)
+ * two_max lifts that skip for valuing a leaf (leafdg=): no move is made on the halved board there,
+ * and in a TAAI game two 32768s will merge, so they are valued as two 16384s, the board Fit would
+ * give. Without it the search's own 16384 + 16384 merge led to a leaf valued as a raw two-32768
+ * board (near 0), and from the 32768..4 snake only 11 of 20 games reached 65536 (20 of 20 with it).
  * Returns b unchanged when the conditions do not hold.
  */
-inline board_t DowngradeRoot(board_t b, int min_rank) {
+inline board_t DowngradeRoot(board_t b, int min_rank, bool two_max = false) {
     unsigned present = 0;
     int n_max = 0;
     for (int i = 0; i < 16; ++i) {
@@ -36,7 +40,7 @@ inline board_t DowngradeRoot(board_t b, int min_rank) {
         n_max += rank == MAX_RANK;
     }
     int top = 31 - __builtin_clz(present | 1);
-    if (min_rank <= 0 || top < min_rank || n_max >= 2) return b;
+    if (min_rank <= 0 || top < min_rank || (n_max >= 2 && !two_max)) return b;
     int r = top - 1;
     while (r >= 1 && ((present >> r) & 1)) --r;
     if (r < 1) return b;
@@ -306,7 +310,7 @@ private:
     // network value of a leaf afterstate, through the cache (entries with ply 0)
     float Leaf(board_t b, int game_stage) {
         if (leaf_dg_rank_ > 0) {
-            board_t d = DowngradeRoot(b, leaf_dg_rank_);
+            board_t d = DowngradeRoot(b, leaf_dg_rank_, true);
             if (d != b) {
                 b = d;
                 game_stage = learner_.Split(d);

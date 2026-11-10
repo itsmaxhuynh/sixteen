@@ -82,8 +82,11 @@ r sits beside halved tiles that show as r but are twice as big, and the search m
 merges, worth large rewards that cannot happen). `leafdg=32768` (instead of `downgrade=`) searches
 the real board and downgrades each leaf on its own just before the network values it, in its own
 stage, so every merge in the tree is real. Rewards along the path are then real points while leaf
-values are on the halved scale. It costs about 40% more per move on 32768 boards (still far below
-100 ms) and changed 0.2% of endgame moves; 100 paired games gave +2.3k (534k -> 537k).
+values are on the halved scale. A leaf holding two 32768s (the search merged two 16384s) is halved
+as well, as `Fit` would show it in a wide game; skipping it valued those leaves near 0 and from the
+32768..4 snake only 11 of 20 games reached 65536. It costs 30 to 40% more per move on 32768 boards
+(still far below 100 ms). 1000 paired games: 545k (leafdg) vs 552k (root), the same reach and split
+rates; from the snake both reach 65536 in 20 of 20 games (mean 1.212M vs 1.213M).
 
 ## 65536 (TAAI merges two 32768s)
 

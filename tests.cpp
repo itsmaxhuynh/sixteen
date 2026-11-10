@@ -460,7 +460,7 @@ struct LeafDowngradeLearner {
     int rank;
     int Split(board_t b) const { return l.Split(b); }
     float Evaluate(board_t b, int stage) const {
-        board_t d = DowngradeRoot(b, rank);
+        board_t d = DowngradeRoot(b, rank, true);
         return d == b ? l.Evaluate(b, stage) : l.Evaluate(d, l.Split(d));
     }
 };
@@ -517,10 +517,22 @@ static void TestLeafDowngrade() {
         int c; do c = rng() % 16; while (b(c) == 15); b.Set(c, 12);
         if (!b.IsTerminal() && DowngradeRoot(b.GetBoard(), 15) != b.GetBoard()) boards.push_back(b);
     }
-    int bad = 0, n = 0, differs = 0, rehalved = 0;
+    // and boards just before a second 32768: a 32768 and two 16384s a slide merges, so leaves hold
+    // two 32768s (halved there as in a wide game; the root, with one 32768, is not)
+    const size_t pairs = boards.size();
+    while (boards.size() < pairs + 60) {
+        Board64 b;
+        for (int i = 0; i < 16; ++i) b.Set(i, rng() % 4 ? 1 + rng() % 6 : 0);
+        int row = rng() % 4;
+        b.Set(4 * row, 15);
+        b.Set(4 * row + 1, 14);
+        b.Set(4 * row + 2, 14);
+        if (!b.IsTerminal()) boards.push_back(b);
+    }
+    int bad = 0, n = 0, differs = 0, rehalved = 0, two_leaves = 0;
     for (size_t k = 0; k < boards.size(); ++k) {
         const Board64 &b = boards[k];
-        int stage = k < endgame ? l->Split(b.GetBoard()) : 4;
+        int stage = k < endgame || k >= pairs ? l->Split(b.GetBoard()) : 4;
         for (int ply = 1; ply <= 3; ++ply) {
             int want, root_move;
             RefMax(ref, b, ply, stage, &want);
@@ -535,9 +547,11 @@ static void TestLeafDowngrade() {
             Board64 c = b;
             if (c.Slide(d) == -1) continue;
             rehalved += HalvedAbove(c.GetBoard()) != HalvedAbove(b.GetBoard());
+            two_leaves += DowngradeRoot(c.GetBoard(), 15) != DowngradeRoot(c.GetBoard(), 15, true);
         }
     }
-    CHECK(n >= 540 && bad == 0);
+    CHECK(n >= 720 && bad == 0);
+    CHECK(two_leaves > 30); // children with two 32768s, which only the leaf rule halves
     CHECK(differs > 20);   // leaf downgrading changes the search, so the boards exercise it
     CHECK(rehalved > 10);  // and some leaves are halved at another tile than the root would be
     std::remove(ckpt.c_str());
@@ -731,8 +745,8 @@ static void TestAdaptivePly() {
 }
 
 // tile-downgrading written out on a grid: the rank r above which tiles halve (largest missing rank
-// with 1 <= r < top), or -1 when downgrading does not apply
-static int NaiveSkippedRank(board_t b, int min_rank) {
+// with 1 <= r < top), or -1 when downgrading does not apply (two 32768s skip it unless two_max)
+static int NaiveSkippedRank(board_t b, int min_rank, bool two_max = false) {
     int top = 0, n_max = 0;
     bool present[16] = {};
     for (int i = 0; i < 16; ++i) {
@@ -741,13 +755,13 @@ static int NaiveSkippedRank(board_t b, int min_rank) {
         top = std::max(top, x);
         n_max += x == 15;
     }
-    if (top < min_rank || n_max >= 2) return -1;
+    if (top < min_rank || (n_max >= 2 && !two_max)) return -1;
     for (int k = top - 1; k >= 1; --k) if (!present[k]) return k;
     return -1;
 }
 
-static board_t NaiveDowngrade(board_t b, int min_rank) {
-    int r = NaiveSkippedRank(b, min_rank);
+static board_t NaiveDowngrade(board_t b, int min_rank, bool two_max = false) {
+    int r = NaiveSkippedRank(b, min_rank, two_max);
     int g[16];
     for (int i = 0; i < 16; ++i) g[i] = int((b >> (4 * i)) & 0xf);
     if (r < 0) return b;
@@ -774,17 +788,34 @@ static void TestDowngrade() {
     CHECK(DowngradeRoot(no4.GetBoard(), 15) == MakeBoard({14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 0}).GetBoard()); // r = 2
     Board64 two_max = MakeBoard({15, 15, 3});
     CHECK(DowngradeRoot(two_max.GetBoard(), 15) == two_max.GetBoard());              // 32768 pair: skipped
+    // leaf valuation (two_max): the pair halves like any tiles, as Fit does for a wide game
+    CHECK(DowngradeRoot(two_max.GetBoard(), 15, true) == MakeBoard({14, 14, 3}).GetBoard());
+    CHECK(DowngradeRoot(MakeBoard({15, 15, 14, 3}).GetBoard(), 15, true) == MakeBoard({14, 14, 13, 3}).GetBoard());
+    Board64 two_full = MakeBoard({15, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1});
+    CHECK(DowngradeRoot(two_full.GetBoard(), 15, true) == two_full.GetBoard());     // none missing
+    CHECK(DowngradeRoot(fig.GetBoard(), 15, true) == DowngradeRoot(fig.GetBoard(), 15)); // one 32768: as before
 
     // random boards with large tiles: same as the naive version, and every move is legal on both
     // boards and gives the downgraded result of the real move
     std::mt19937_64 rng(77);
-    int applied = 0, bad = 0;
+    int applied = 0, two_applied = 0, bad = 0;
     for (int k = 0; k < 200000; ++k) {
         board_t b = 0;
         for (int i = 0; i < 16; ++i) b |= board_t(rng() % 4 ? rng() % 16 : 0) << (4 * i);
         if (k % 2) b = (b & ~board_t(0xf)) | 15; // half of them hold a 32768 in cell 0
         board_t d = DowngradeRoot(b, 15);
         bad += d != NaiveDowngrade(b, 15);
+        // two_max: the naive version, the same as without it below two 32768s, and on two 32768s
+        // the board Fit gives the wide game (WideBoard.h), which closes the same missing rank
+        board_t d2 = DowngradeRoot(b, 15, true);
+        bad += d2 != NaiveDowngrade(b, 15, true);
+        int n_max = 0;
+        for (int i = 0; i < 16; ++i) n_max += ((b >> (4 * i)) & 0xf) == 15;
+        if (n_max < 2) bad += d2 != d;
+        if (n_max == 2) {
+            bad += d2 != Fit(WideBoard::From(b));
+            two_applied += d2 != b;
+        }
         if (d == b) continue;
         ++applied;
         int r = NaiveSkippedRank(b, 15);
@@ -801,7 +832,7 @@ static void TestDowngrade() {
             bad += db.GetBoard() != want;
         }
     }
-    CHECK(applied > 10000 && bad == 0);
+    CHECK(applied > 10000 && two_applied > 1000 && bad == 0);
 }
 
 // TdPlayer with downgrade=: the move is the plain player's move on the downgraded board, valued
@@ -1022,6 +1053,7 @@ static void TestExplain() {
                 int top = 4 + k / 10;
                 for (int i = 0; i < 16; ++i) b.Set(i, rng() % 10 ? 1 + rng() % (top - 1) : 0);
                 if (k % 7 == 3) { b.Set(rng() % 16, 15); b.Set(rng() % 16, 14); b.Set(rng() % 16, 13); }
+                if (k % 7 == 5) { b.Set(0, 15); b.Set(1, 14); b.Set(2, 14); } // Left makes two 32768s
                 if (b.IsTerminal()) continue;
                 ++n;
                 int move = play.TakeAction(b).event() & 0b11;

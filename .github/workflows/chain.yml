@@ -30,7 +30,7 @@ jobs:
       max-parallel: 1
       fail-fast: false
       matrix:
-        exp: [main, x3a, x3b, x4a, x4b, x5, x5s1, x5s2, x5s3, x5s4, x5t1, x5t2, x5t3, x5t4]
+        exp: [main, x3a, x3b, x4a, x4b, x5, x5s1, x5s2, x5s3, x5s4, x5t1, x5t2, x5t3, x5t4, x5u2]
     env:
       EXP: ${{ matrix.exp != 'main' && matrix.exp || '' }}
       RUNS: ${{ matrix.exp != 'main' && matrix.exp || 'latest' }}

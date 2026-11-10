@@ -560,7 +560,7 @@ public:
             board_t leaf = child.GetBoard();
             int stage = e.stage;
             if (leaf_dg_rank_ > 0) { // as Search::Leaf values it
-                board_t dg = DowngradeRoot(leaf, leaf_dg_rank_);
+                board_t dg = DowngradeRoot(leaf, leaf_dg_rank_, true);
                 if (dg != leaf) { leaf = dg; stage = learner_->Split(dg); }
             }
             e.network[d] = reward + learner_->Evaluate(leaf, stage);

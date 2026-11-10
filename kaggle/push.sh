@@ -76,6 +76,13 @@ case "$exp" in
     k=${exp#x5t}
     targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([30000000 if s == k else 10000000 for s in range(5)])" "$k")
     override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'restart_alpha': 0.00025, 'restart_from': 20000000}" ;;
+  # x5u1..x5u4: 10M more (30M -> 40M) for stage k, from x5t<k>'s finished checkpoint and boards, on a
+  # cooler cosine: from x5t's final alpha 2.5e-05 down to 2.5e-06 (fine-tuning, no warm restart).
+  # First push: SEED=sixteen-x5t<k> MIN_GAMES=70000000. Merge as for x5s (base sixteen-x5, k=sixteen-x5u<k>).
+  x5u[1-4])
+    k=${exp#x5u}
+    targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([40000000 if s == k else 10000000 for s in range(5)])" "$k")
+    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'restart_alpha': 0.000025, 'restart_from': 30000000, 'alpha_min': 0.0000025}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
