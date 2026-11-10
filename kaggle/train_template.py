@@ -18,10 +18,10 @@
 # doubled (not in the last stage). Off when absent.
 # A stage's schedule and init can be changed for stages that have not started yet; changing them for
 # the stage in progress mixes schedules (allowed, but the cosine then starts mid-curve).
-# Single-stage sessions ('only_stage': k > 0): once every stage exists, stage k trains on its own
-# (its games start from boards<k>.bin and only read stage k's weights), so stages can train in
-# separate kernels at the same time and be merged afterwards (./sixteen --merge, Merge.h). Such a
-# session first fills boards<k>.bin to `collect` distinct boards (repeats are dropped, see
+# Single-stage sessions ('only_stage': k): once every stage exists, stage k trains on its own
+# (its games start from boards<k>.bin, or from the empty board for k = 0, and only read stage k's
+# weights), so stages can train in separate kernels at the same time and be merged afterwards
+# (./sixteen --merge, Merge.h). For k > 0 such a session first fills boards<k>.bin to `collect` distinct boards (repeats are dropped, see
 # StartPositions.h), playing stages 0..k-1 of its checkpoint from boards<k-1>.bin, then trains stage k
 # up to stage_games[k] and stops. alpha: the stage's own schedule (for 'cos', past its end: alpha_min),
 # or with 'restart_alpha' a fresh cosine from restart_alpha down to alpha_min over the games after
@@ -165,11 +165,11 @@ def only_stage_step(ckpt):
     """one step of a single-stage session (see the top); returns (checkpoint, finished)"""
     k = CONFIG["only_stage"]
     meta = info(ckpt)
-    if not 0 < k < meta["stages"]:
-        raise SystemExit(f"only_stage={k}: needs a stage from 1 to {meta['stages'] - 1}")
-    boards = boards_path(k)
-    have = distinct_boards(boards)
-    if have < CONFIG["collect"]:
+    if not 0 <= k < meta["stages"]:
+        raise SystemExit(f"only_stage={k}: needs a stage from 0 to {meta['stages'] - 1}")
+    boards = boards_path(k) if k > 0 else None
+    have = distinct_boards(boards) if boards else 0
+    if boards and have < CONFIG["collect"]:
         log(f"only stage {k}: {have}/{CONFIG['collect']} distinct boards in {boards}, collecting with stage {k - 1}")
         start = [f"--start={boards_path(k - 1)}"] if k > 1 else []
         run([f"--collect={boards}", f"--collect-count={CONFIG['collect']}", "--total=1000000000000"] + start +
@@ -186,8 +186,8 @@ def only_stage_step(ckpt):
         else:
             total, alpha = train_args(k, games)
         log(f"only stage {k}: {games} games, training {total} more with {alpha}")
-        run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}", f"--start={boards}"] +
-            hard_args(k, meta["stages"]) +
+        run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}"] +
+            ([f"--start={boards}"] if boards else []) + hard_args(k, meta["stages"]) +
             [f"--play=load={ckpt} save={CKPT} stage={k} {alpha} lambda={CONFIG['lambda']}"])
         return CKPT, False
     msg = f"only stage {k}: done, stages trained: {meta['games']}"
@@ -204,7 +204,7 @@ def main():
         log("no checkpoint found, starting stage 0 from scratch")
 
     while remaining() > 60:
-        if CONFIG.get("only_stage"):
+        if CONFIG.get("only_stage") is not None:  # 0 is a stage
             if ckpt is None:
                 raise SystemExit("only_stage needs a checkpoint with every stage to start from")
             ckpt, finished = only_stage_step(ckpt)

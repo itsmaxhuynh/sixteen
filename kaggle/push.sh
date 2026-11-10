@@ -83,6 +83,11 @@ case "$exp" in
     k=${exp#x5u}
     targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([40000000 if s == k else 10000000 for s in range(5)])" "$k")
     override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'restart_alpha': 0.000025, 'restart_from': 30000000, 'alpha_min': 0.0000025}" ;;
+  # x5u0: stage 0 never got the extensions above (it stopped at x5's 10M), so it trains on its own
+  # from x5's checkpoint: 10M more (10M -> 20M; ~30h at stage 0's ~340k games/h, so it fits before
+  # TAAI) on one cosine from 0.00025 down to 2.5e-06, starting from the empty board as in x5.
+  # First push: SEED=sixteen-x5 MIN_GAMES=50000000. Merge with base sixteen-x5, 0=sixteen-x5u0.
+  x5u0) override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': 0, 'stage_games': [20000000, 10000000, 10000000, 10000000, 10000000], 'restart_alpha': 0.00025, 'restart_from': 10000000, 'alpha_min': 0.0000025}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
