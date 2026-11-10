@@ -10,3 +10,5 @@ arena-link-*
 kaggle/runs/
 .remember/
 .claude.local.md
+games/
+ckpt/

@@ -126,6 +126,11 @@ public:
 
     void SetPrune(float p) { prune_ = p; }
     void SetRootCut(int keep, float cut) { root_keep_ = keep; root_cut_ = cut; }
+    // leaf downgrading (an alternative to downgrading the root, see DowngradeRoot): the search plays
+    // the real board, and each leaf is downgraded on its own just before the network values it,
+    // with the stage of its downgraded board; 0 = off
+    void SetLeafDowngrade(int min_rank) { leaf_dg_rank_ = min_rank; }
+
     void SetSample(int k) { sample_ = k >= 15 ? 0 : k; } // an afterstate has <= 15 empty cells: k >= 15 never samples
 
     // fixed depth, no time limit
@@ -144,6 +149,13 @@ public:
         r.ms = Elapsed();
         r.nodes = nodes_;
         return r;
+    }
+
+    // value of each root move at a fixed depth (-inf: illegal), as Fixed weighs them without root
+    // pruning: the move Fixed picks is the first one with the largest value
+    void RootValues(const Board64 &board, int ply, int game_stage, float values[4]) {
+        Start(INFINITY);
+        RootNode(board, ply, game_stage, 0xf, values);
     }
 
     /**
@@ -289,6 +301,13 @@ private:
 
     // network value of a leaf afterstate, through the cache (entries with ply 0)
     float Leaf(board_t b, int game_stage) {
+        if (leaf_dg_rank_ > 0) {
+            board_t d = DowngradeRoot(b, leaf_dg_rank_);
+            if (d != b) {
+                b = d;
+                game_stage = learner_.Split(d);
+            }
+        }
         if (!table_) return learner_.Evaluate(b, game_stage);
         Entry &slot = table_[Hash(b, 0, game_stage) & mask_];
         if (slot.generation == generation_ && slot.board == b && slot.ply == 0 && slot.stage == game_stage && slot.mode == 0) {
@@ -353,6 +372,7 @@ private:
     int root_keep_ = 4;
     float root_cut_ = 0;
     int sample_ = 0;
+    int leaf_dg_rank_ = 0;
     int root_ply_ = 0;
     Clock::time_point start_;
     double hard_ms_ = INFINITY;

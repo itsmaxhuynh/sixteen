@@ -452,6 +452,96 @@ static void TestSearchLearner() {
     std::remove(ckpt.c_str());
 }
 
+// a learner whose leaf values are leaf-downgraded: Search with SetLeafDowngrade must equal plain
+// expectimax on it (the real board searched, each leaf halved on its own and valued in its stage)
+struct LeafDowngradeLearner {
+    const TdLearner &l;
+    int rank;
+    int Split(board_t b) const { return l.Split(b); }
+    float Evaluate(board_t b, int stage) const {
+        board_t d = DowngradeRoot(b, rank);
+        return d == b ? l.Evaluate(b, stage) : l.Evaluate(d, l.Split(d));
+    }
+};
+
+// the tile DowngradeRoot halves above (its largest missing rank), -1 if it leaves b unchanged
+static int HalvedAbove(board_t b) {
+    if (DowngradeRoot(b, 15) == b) return -1;
+    unsigned present = 0;
+    for (int i = 0; i < 16; ++i) present |= 1u << ((b >> (4 * i)) & 0xf);
+    int r = 31 - __builtin_clz(present) - 1;
+    while ((present >> r) & 1) --r;
+    return r;
+}
+
+static void TestLeafDowngrade() {
+    NTupleNetwork net(5, kFeatAll, {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}});
+    std::mt19937 rng(23);
+    std::uniform_real_distribution<float> w(-50, 50);
+    for (int s = 0; s < 5; ++s) {
+        net.InitStage(s);
+        for (auto &table : net.StageWeights(s)) for (float &x : table) x = w(rng);
+    }
+    TrainingState st;
+    st.active = 4;
+    st.games = {1, 1, 1, 1, 1};
+    std::string ckpt = "/tmp/sixteen-leafdg.ckpt";
+    if (const char *dir = std::getenv("TMPDIR")) ckpt = std::string(dir) + "/sixteen-leafdg.ckpt";
+    net.Save(ckpt, st);
+    auto l = MakeLearner("load=" + ckpt);
+    LeafDowngradeLearner ref{*l, 15};
+    Search<TdLearner> cached(*l, 16), uncached(*l, 0), plain(*l, 16);
+    cached.SetLeafDowngrade(15);
+    uncached.SetLeafDowngrade(15);
+    // endgame boards: 32768 16384 8192 4096 along the bottom, 2048 missing, two 1024s that a slide
+    // can merge into the missing 2048 (so leaves are halved at different tiles), small tiles elsewhere
+    std::vector<Board64> boards;
+    while (boards.size() < 120) {
+        Board64 b;
+        for (int i = 0; i < 12; ++i) b.Set(i, rng() % 4 ? 1 + rng() % 5 : 0);
+        for (int i = 0; i < 4; ++i) b.Set(12 + i, 15 - i);
+        int row = rng() % 3, col = rng() % 3;
+        b.Set(4 * row + col, 10);
+        if (rng() % 2) b.Set(4 * row + col + 1, 10);
+        else if (row < 2) b.Set(4 * (row + 1) + col, 10);
+        if (!b.IsTerminal() && DowngradeRoot(b.GetBoard(), 15) != b.GetBoard()) boards.push_back(b);
+    }
+    // and boards from late in a game (stage 4 reached) whose 16384 and 8192 have merged away: 32768
+    // and 4096 with small tiles, halved to a stage-1 board, so a leaf valued in the game's stage shows
+    const size_t endgame = boards.size();
+    while (boards.size() < endgame + 60) {
+        Board64 b;
+        for (int i = 0; i < 16; ++i) b.Set(i, rng() % 4 ? 1 + rng() % 6 : 0);
+        b.Set(rng() % 16, 15);
+        int c; do c = rng() % 16; while (b(c) == 15); b.Set(c, 12);
+        if (!b.IsTerminal() && DowngradeRoot(b.GetBoard(), 15) != b.GetBoard()) boards.push_back(b);
+    }
+    int bad = 0, n = 0, differs = 0, rehalved = 0;
+    for (size_t k = 0; k < boards.size(); ++k) {
+        const Board64 &b = boards[k];
+        int stage = k < endgame ? l->Split(b.GetBoard()) : 4;
+        for (int ply = 1; ply <= 3; ++ply) {
+            int want, root_move;
+            RefMax(ref, b, ply, stage, &want);
+            RefMax(*l, b, ply, stage, &root_move);
+            bad += cached.Fixed(b, ply, stage).move != want;
+            bad += uncached.Fixed(b, ply, stage).move != want;
+            differs += plain.Fixed(b, ply, stage).move != want;
+            ++n;
+        }
+        // some children fill the missing 2048, so their leaves are halved at a lower tile
+        for (int d = 0; d < 4; ++d) {
+            Board64 c = b;
+            if (c.Slide(d) == -1) continue;
+            rehalved += HalvedAbove(c.GetBoard()) != HalvedAbove(b.GetBoard());
+        }
+    }
+    CHECK(n >= 540 && bad == 0);
+    CHECK(differs > 20);   // leaf downgrading changes the search, so the boards exercise it
+    CHECK(rehalved > 10);  // and some leaves are halved at another tile than the root would be
+    std::remove(ckpt.c_str());
+}
+
 // time-limited search: a legal move, at least 2 plies, the deepest finished depth's move, and
 // within the hard deadline (with slack for one 16-node check interval)
 static void TestSearchTimed() {
@@ -759,6 +849,71 @@ static void TestDowngradePlayer() {
         }
         CHECK(n > 300 && same > 50 && expected_downgrades > 50 && differ_stage > 20 && bad == 0);
         CHECK(down.TakeMoveStats().downgraded == expected_downgrades);
+    }
+    std::remove(path.c_str());
+}
+
+// TdPlayer::Explain (--explain): on the same sequence of boards, the first best move by its search
+// values is the move TakeAction plays, with the same game stage carried from board to board; illegal
+// moves are -inf; its network values are reward + the learner's afterstate value
+static void TestExplain() {
+    std::vector<std::vector<int>> small = {{0, 1, 2, 3}, {4, 5, 6, 7}, {0, 1, 4, 5}};
+    NTupleNetwork net(5, kFeatAll, small);
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> w(-1000, 1000);
+    for (int s = 0; s < 5; ++s) {
+        net.InitStage(s);
+        for (auto &table : net.StageWeights(s)) for (float &x : table) x = w(rng);
+    }
+    TrainingState st;
+    st.active = 4;
+    st.games = {1, 1, 1, 1, 1};
+    std::string path = "/tmp/sixteen-explain.ckpt";
+    if (const char *dir = std::getenv("TMPDIR")) path = std::string(dir) + "/sixteen-explain.ckpt";
+    net.Save(path, st);
+
+    for (const char *search : {"ply=1", "ply=2 tt=12", "ply=1 deep=9,5 tt=12", "ply=2 deep=6 downgrade=32768 tt=12",
+                               "ply=2 leafdg=32768 tt=12"}) {
+        const bool leafdg = std::string(search).find("leafdg") != std::string::npos;
+        TdPlayer play("load=" + path + " " + search);
+        TdPlayer explain(play.shared_learner(), search);
+        int n = 0, bad = 0, deeper = 0, downgraded = 0, illegal = 0;
+        for (int game = 0; game < 4; ++game) {
+            play.OpenEpisode();
+            explain.OpenEpisode();
+            // boards of rising tiles, so the game stage only ever grows within a game; some boards
+            // early in a game reach a split, and later boards without its tiles keep that stage
+            for (int k = 0; k < 120; ++k) {
+                Board64 b;
+                int top = 4 + k / 10;
+                for (int i = 0; i < 16; ++i) b.Set(i, rng() % 10 ? 1 + rng() % (top - 1) : 0);
+                if (k % 7 == 3) { b.Set(rng() % 16, 15); b.Set(rng() % 16, 14); b.Set(rng() % 16, 13); }
+                if (b.IsTerminal()) continue;
+                ++n;
+                int move = play.TakeAction(b).event() & 0b11;
+                TdPlayer::Explanation e = explain.Explain(b);
+                bad += int(std::max_element(e.search, e.search + 4) - e.search) != move;
+                deeper += e.ply > 2;
+                downgraded += e.downgraded;
+                Board64 root = e.downgraded ? Board64(DowngradeRoot(b.GetBoard(), 15)) : b;
+                for (int d = 0; d < 4; ++d) {
+                    Board64 c = root;
+                    reward_t r = c.Slide(d);
+                    illegal += r == -1;
+                    if (r == -1) {
+                        bad += e.search[d] != -INFINITY || e.network[d] != -INFINITY;
+                    } else {
+                        float v = leafdg ? LeafDowngradeLearner{*play.shared_learner(), 15}.Evaluate(c.GetBoard(), e.stage)
+                                         : play.shared_learner()->Evaluate(c.GetBoard(), e.stage);
+                        bad += e.network[d] != r + v;
+                        bad += e.search[d] == -INFINITY;
+                    }
+                }
+            }
+        }
+        CHECK(n > 300 && illegal > 50 && bad == 0);
+        if (std::string(search).find("deep") != std::string::npos) CHECK(deeper > 20);
+        if (std::string(search).find("downgrade") != std::string::npos) CHECK(downgraded > 20);
     }
     std::remove(path.c_str());
 }
@@ -1240,8 +1395,10 @@ int main() {
     TestOptimisticInit();
     TestDowngrade();
     TestDowngradePlayer();
+    TestExplain();
     TestSearchExact();
     TestSearchLearner();
+    TestLeafDowngrade();
     TestSearchTimed();
     TestSearchApprox();
     TestAdaptivePly();

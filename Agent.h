@@ -518,18 +518,9 @@ public:
     }
 
     Action TakeAction(const Board64 &board) override {
-        game_stage_ = std::max(game_stage_, learner_->Split(board.GetBoard()));
-        // the search runs on the downgraded board, valued as a board of its own (stage from its tiles)
-        Board64 root = board;
-        int stage = game_stage_;
-        if (downgrade_rank_ > 0) {
-            board_t d = DowngradeRoot(board.GetBoard(), downgrade_rank_);
-            if (d != board.GetBoard()) {
-                root = Board64(d);
-                stage = learner_->Split(d);
-                downgraded_++;
-            }
-        }
+        int stage;
+        Board64 root = Root(board, &stage);
+        if (root.GetBoard() != board.GetBoard()) downgraded_++;
         int move;
         if (!search_) {
             move = learner_->BestMove(root, ply_, stage);
@@ -542,6 +533,49 @@ public:
         }
         return move == -1 ? Action() : Action(Action::Slide(move));
     }
+
+    // Why TakeAction would pick its move on this board (--explain): the value of each move
+    // (reward + expected value of what follows; -inf if illegal) by the search TakeAction runs, and
+    // by the network alone (reward + afterstate value). Advances the game stage like TakeAction, so
+    // call it, or Observe, on every player board of a game in order. Fixed depth only (no time=),
+    // and without root pruning (rootk/rootcut), which would leave the cut moves unvalued.
+    struct Explanation {
+        float search[4], network[4];
+        int ply = 1;             // search depth used
+        int stage = 0;           // network stage the root was valued in
+        bool downgraded = false; // searched on the downgraded board
+    };
+    Explanation Explain(const Board64 &board) {
+        if (time_ms_ > 0) throw std::invalid_argument("--explain needs a fixed ply, not time=");
+        Explanation e;
+        Board64 root = Root(board, &e.stage);
+        e.downgraded = root.GetBoard() != board.GetBoard();
+        for (int d = 0; d < 4; ++d) {
+            Board64 child = root;
+            reward_t reward = child.Slide(d);
+            if (reward == -1) {
+                e.network[d] = -INFINITY;
+                continue;
+            }
+            board_t leaf = child.GetBoard();
+            int stage = e.stage;
+            if (leaf_dg_rank_ > 0) { // as Search::Leaf values it
+                board_t dg = DowngradeRoot(leaf, leaf_dg_rank_);
+                if (dg != leaf) { leaf = dg; stage = learner_->Split(dg); }
+            }
+            e.network[d] = reward + learner_->Evaluate(leaf, stage);
+        }
+        if (!search_) {
+            std::copy(e.network, e.network + 4, e.search);
+        } else {
+            e.ply = AdaptivePly(ply_, root.CountEmpty(), deep_);
+            search_->RootValues(root, e.ply, e.stage, e.search);
+        }
+        return e;
+    }
+
+    // a player board passed without explaining it: only the game stage advances
+    void Observe(const Board64 &board) { game_stage_ = std::max(game_stage_, learner_->Split(board.GetBoard())); }
 
     std::shared_ptr<TdLearner> shared_learner() const { return learner_; }
 
@@ -558,6 +592,27 @@ public:
     }
 
 private:
+    // advance the game stage, then the board the search runs on: the downgraded board when
+    // downgrade= applies, valued as a board of its own (stage from its tiles)
+    Board64 Root(const Board64 &board, int *stage) {
+        Observe(board);
+        *stage = game_stage_;
+        if (downgrade_rank_ > 0) {
+            board_t d = DowngradeRoot(board.GetBoard(), downgrade_rank_);
+            if (d != board.GetBoard()) {
+                *stage = learner_->Split(d);
+                return Board64(d);
+            }
+        }
+        return board;
+    }
+
+public:
+    int DowngradeRank() const { return downgrade_rank_; }
+    int LeafDowngradeRank() const { return leaf_dg_rank_; }
+
+private:
+
     void ReadPly() {
         ply_ = Has("ply") ? int(meta_["ply"]) : 1;
         if (ply_ < 1) throw std::invalid_argument("ply must be >= 1");
@@ -572,6 +627,15 @@ private:
                 throw std::invalid_argument("downgrade must be 0 or a tile 16..32768");
             if (tile) downgrade_rank_ = __builtin_ctz(tile);
         }
+        // leafdg=<tile>: downgrade each leaf of the search instead of the root (Search.h)
+        leaf_dg_rank_ = 0;
+        if (Has("leafdg")) {
+            unsigned tile = unsigned(meta_["leafdg"]);
+            if (tile != 0 && (tile < 16 || (tile & (tile - 1)) || tile > 32768))
+                throw std::invalid_argument("leafdg must be 0 or a tile 16..32768");
+            if (tile) leaf_dg_rank_ = __builtin_ctz(tile);
+            if (leaf_dg_rank_ && downgrade_rank_) throw std::invalid_argument("downgrade= and leafdg= exclude each other");
+        }
         deep_.clear();
         if (Has("deep")) {
             std::string list = meta_["deep"].value;
@@ -584,7 +648,7 @@ private:
             }
             if (time_ms_ > 0 && !deep_.empty()) throw std::invalid_argument("deep= is for fixed ply, not time=");
         }
-        if (ply_ > 1 || time_ms_ > 0 || !deep_.empty()) {
+        if (ply_ > 1 || time_ms_ > 0 || !deep_.empty() || leaf_dg_rank_) {
             search_.reset(new Search<TdLearner>(*learner_, Has("tt") ? int(meta_["tt"]) : 22));
             if (Has("prune")) search_->SetPrune(float(meta_["prune"]));
             int keep = Has("rootk") ? int(meta_["rootk"]) : 4;
@@ -594,6 +658,7 @@ private:
             int sample = Has("sample") ? int(meta_["sample"]) : 0;
             if (sample < 0 || sample > 16) throw std::invalid_argument("sample must be 0..16");
             search_->SetSample(sample);
+            search_->SetLeafDowngrade(leaf_dg_rank_);
         }
     }
 
@@ -604,6 +669,7 @@ private:
     int max_ply_ = 8;
     int game_stage_ = 0;
     int downgrade_rank_ = 0;
+    int leaf_dg_rank_ = 0;
     std::vector<int> deep_;
     uint64_t ply_sum_ = 0, ply_moves_ = 0, downgraded_ = 0;
 };

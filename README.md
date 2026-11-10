@@ -72,6 +72,28 @@ halved large tiles are ones the network trained on far more often. Skipped with 
 which merge only on the halved board. The paper's ablation credits it with 587k -> 625k mean at
 6-ply; `downgraded_moves=` in the `eval:` line counts the moves it changed the board for.
 
+Root downgrading has a flaw inside the search: once a merge builds the missing tile r, the new real
+r sits beside halved tiles that show as r but are twice as big, and the search merges them (phantom
+merges, worth large rewards that cannot happen). `leafdg=32768` (instead of `downgrade=`) searches
+the real board and downgrades each leaf on its own just before the network values it, in its own
+stage, so every merge in the tree is real. Rewards along the path are then real points while leaf
+values are on the halved scale. It costs about 40% more per move on 32768 boards (still far below
+100 ms) and changed 0.2% of endgame moves; 100 paired games gave +2.3k (534k -> 537k).
+
+## Inspecting moves
+
+```bash
+# every recorded slide with the value of each move (U,R,D,L): v= search, n= network 1-ply
+zcat games.txt.gz | ./sixteen --explain=- --explain-out=values.txt --explain-game=893 \
+  --play="load=w.ckpt ply=3 deep=2 downgrade=32768"
+# the whole expectimax tree on one board (agent to move), checked against the search itself
+./sixteen --tree=021214211aacfed1 --tree-ply=2 --tree-stage=4 --play="load=w.ckpt leafdg=32768"
+```
+
+`--explain` replays games recorded by `--record` with the same `--play` args and warns about any
+slide that is not the search's first best move, so it doubles as a check that a recording and a
+checkpoint belong together. Its output loads into the replay viewer, which shows the move values.
+
 All of these take `--threads=N` (default 1). Training is Hogwild: one shared network, lock-free
 updates through relaxed `std::atomic_ref`, a pause at each `--save-every` boundary so checkpoints are
 consistent. On 4 threads the 20k-game learning curve matches 1 thread at 3.3x the speed, and

@@ -17,11 +17,14 @@
  *   (--move-limit-ms=100 sets the threshold counted as over the limit). See eval.sh.
  *   --record=games.txt [--record-tile=32768]: write every game that reaches the tile, move by move
  *   (RecordGame below has the format); not with --learn
+ * Explain:   zcat games.txt.gz | ./sixteen --explain=- --explain-out=x.txt --explain-game=893 --play="<eval args>"
+ *   each recorded slide with the value of every move (ExplainGames below)
  * Inspect:   ./sixteen --info=w.ckpt
  * Match:     --play="load=w.ckpt time=50"  iterative deepening within 50 ms per move (see Agent.h)
  * Arena:     ./sixteen --shell --name=<account> --play="load=w.ckpt ply=3"
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <atomic>
@@ -408,9 +411,281 @@ int MergeCheckpoints(int argc, const char *argv[]) {
     return PrintCheckpointInfo(out);
 }
 
+/**
+ * --explain=<games.txt or -> --explain-out=<file> --play="<the eval's args>" [--explain-game=<i,j,...>]
+ * [--explain-from=<step>]: replay recorded games (RecordGame format) and append to each slide line at
+ * or after step the values the player weighed when it chose that slide, each in U,R,D,L order with
+ * "-" for an illegal move:
+ *   <step> <move> <reward> <score> <board> v=<search values> n=<network values> ply=<depth> [dg]
+ * v: reward + expected value by the player's search (what it maximised); n: reward + network value
+ * of the afterstate (1-ply); dg: valued on the downgraded board. Other lines are copied unchanged.
+ * Warns about any slide that is not the first best move by v (another checkpoint or other args).
+ */
+int ExplainGames(int argc, const char *argv[]) {
+    std::string in_path, out_path, play_args, games_arg;
+    long from = 0;
+    for (int i = 1; i < argc; i++) {
+        std::string para(argv[i]);
+        std::string value = para.substr(para.find('=') + 1);
+        if (para.find("--explain=") == 0) in_path = value;
+        else if (para.find("--explain-out=") == 0) out_path = value;
+        else if (para.find("--explain-game=") == 0) games_arg = value;
+        else if (para.find("--explain-from=") == 0) from = std::stol(value);
+        else if (para.find("--play=") == 0) play_args = value;
+        else throw std::invalid_argument("--explain takes no other option: " + para);
+    }
+    std::vector<long> wanted;
+    for (size_t at = 0; at < games_arg.size();) {
+        size_t comma = std::min(games_arg.find(',', at), games_arg.size());
+        wanted.push_back(std::stol(games_arg.substr(at, comma - at)));
+        at = comma + 1;
+    }
+    std::ifstream file;
+    if (in_path != "-") {
+        file.open(in_path);
+        if (!file) throw std::invalid_argument("cannot read " + in_path);
+    }
+    std::istream &in = in_path == "-" ? std::cin : file;
+    if (out_path.empty()) throw std::invalid_argument("--explain needs --explain-out=<file>");
+    // written as <out>.part and renamed when done, so a file with the final name is always complete
+    const std::string part_path = out_path + ".part";
+    std::ofstream out(part_path);
+    if (!out) throw std::invalid_argument("cannot write " + part_path);
+
+    TdPlayer player(play_args);
+    auto parse = [](const std::string &hex) {
+        if (hex.size() != 16) throw std::invalid_argument("bad board: " + hex);
+        board_t b = 0;
+        for (int i = 0; i < 16; ++i) b |= board_t(std::stoi(hex.substr(i, 1), nullptr, 16)) << (4 * i);
+        return b;
+    };
+    auto list = [](const float v[4]) {
+        std::ostringstream s;
+        s << std::fixed << std::setprecision(1);
+        for (int d = 0; d < 4; ++d) {
+            if (d) s << ',';
+            if (v[d] == -INFINITY) s << '-';
+            else s << v[d];
+        }
+        return s.str();
+    };
+
+    std::string line;
+    bool keep = false;
+    long game = -1;
+    board_t board = 0;
+    size_t explained = 0, differ = 0, games = 0, over_100 = 0;
+    double slowest_ms = 0;
+    long slowest_game = -1, slowest_step = -1;
+    auto start = std::chrono::steady_clock::now();
+    while (std::getline(in, line)) {
+        std::istringstream fields(line);
+        std::string first;
+        fields >> first;
+        if (first == "game") {
+            fields >> game;
+            keep = wanted.empty() || std::find(wanted.begin(), wanted.end(), game) != wanted.end();
+            if (keep) {
+                player.OpenEpisode();
+                games++;
+            }
+        } else if (first == "start" && keep) {
+            std::string hex;
+            fields >> hex;
+            board = parse(hex);
+        } else if (!first.empty() && keep && std::isdigit(static_cast<unsigned char>(first[0]))) {
+            long step = std::stol(first);
+            std::string move, reward, score, hex;
+            fields >> move >> reward >> score >> hex;
+            board_t after = parse(hex);
+            int slide = std::string("URDL").find(move);
+            if (move.size() == 1 && slide >= 0) {
+                if (step < from) {
+                    player.Observe(Board64(board));
+                } else {
+                    auto t0 = std::chrono::steady_clock::now();
+                    TdPlayer::Explanation e = player.Explain(Board64(board));
+                    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    if (ms > slowest_ms) { slowest_ms = ms; slowest_game = game; slowest_step = step; }
+                    over_100 += ms > 100;
+                    int best = int(std::max_element(e.search, e.search + 4) - e.search);
+                    if (best != slide && differ++ < 10) {
+                        std::cerr << "game " << game << " step " << step << ": played " << move << ", search prefers "
+                                  << "URDL"[best] << " (" << list(e.search) << ")" << std::endl;
+                    }
+                    line += " v=" + list(e.search) + " n=" + list(e.network) + " ply=" + std::to_string(e.ply);
+                    if (e.downgraded) line += " dg";
+                    explained++;
+                }
+            }
+            board = after;
+        }
+        if (keep) out << line << '\n';
+    }
+    out.close();
+    if (!out || std::rename(part_path.c_str(), out_path.c_str()) != 0)
+        throw std::runtime_error("cannot finish " + out_path + " (partial output left in " + part_path + ")");
+    double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    std::cerr << "explained " << explained << " moves in " << games << " game(s) in " << std::fixed << std::setprecision(1)
+              << secs << " s; " << differ << " differ from the search's choice; slowest move " << slowest_ms << " ms (game "
+              << slowest_game << " step " << slowest_step << "), " << over_100 << " over 100 ms" << std::endl;
+    return differ ? 2 : 0;
+}
+
+/**
+ * --tree=<board hex> --play="<args>" [--tree-ply=2] [--tree-stage=k]: print the whole expectimax tree
+ * the player searches on one board (agent to move): every move with its reward, every spawn, and
+ * every leaf with the board the network values (halved under downgrade= or leafdg=) and its value.
+ * Mirrors Search's arithmetic without the cache, and checks the root totals against Search itself.
+ * --tree-stage: the stage the game had reached (default: the board's own split).
+ */
+struct TreePrinter {
+    const TdLearner &learner;
+    int leaf_rank;
+    std::ostream &out;
+
+    static std::string Tiles(board_t b) {
+        static const char *label[16] = {".", "2", "4", "8", "16", "32", "64", "128", "256", "512", "1k", "2k", "4k", "8k", "16k", "32k"};
+        std::string s;
+        for (int i = 0; i < 16; ++i) {
+            if (i && i % 4 == 0) s += " |";
+            std::string t = label[(b >> (4 * i)) & 0xf];
+            s += std::string(4 - std::min<size_t>(4, t.size()), ' ') + t;
+        }
+        return s;
+    }
+    static std::string Num(float v) {
+        std::ostringstream s;
+        s << std::fixed << std::setprecision(1) << v;
+        return s.str();
+    }
+    std::string Pad(int depth) const { return std::string(4 * depth, ' '); }
+
+    float Leaf(board_t b, int stage, int depth, int dir, reward_t reward) {
+        const board_t real = b;
+        std::string note;
+        if (leaf_rank > 0) {
+            board_t d = DowngradeRoot(b, leaf_rank);
+            if (d != b) {
+                note = "  halved:" + Tiles(d);
+                b = d;
+                stage = learner.Split(d);
+            }
+        }
+        float v = learner.Evaluate(b, stage);
+        out << Pad(depth) << "URDL"[dir] << " +" << reward << "  leaf:" << Tiles(real) << note
+            << "  stage " << stage << "  net " << Num(v) << "  = " << Num(reward + v) << "\n";
+        return v;
+    }
+    float Max(const Board64 &board, int ply, int stage, int depth) {
+        float best = -INFINITY;
+        int best_d = -1;
+        for (int d = 0; d < 4; ++d) {
+            Board64 child = board;
+            reward_t reward = child.Slide(d);
+            if (reward == -1) continue;
+            float value;
+            if (ply <= 1) {
+                value = reward + Leaf(child.GetBoard(), stage, depth, d, reward);
+            } else {
+                out << Pad(depth) << "URDL"[d] << " +" << reward << "  after:" << Tiles(child.GetBoard()) << "\n";
+                value = reward + Chance(child, ply - 1, stage, depth + 1);
+                out << Pad(depth) << "= " << "URDL"[d] << " " << Num(value) << "\n";
+            }
+            if (value > best) { best = value; best_d = d; }
+        }
+        if (best_d == -1) {
+            out << Pad(depth) << "no legal move: game over, value 0\n";
+            return 0.0f;
+        }
+        return best;
+    }
+    float Chance(const Board64 &after, int ply, int stage, int depth) {
+        stage = std::max(stage, learner.Split(after.GetBoard()));
+        int n = after.CountEmpty();
+        float total = 0;
+        for (int i = 0; i < 16; ++i) {
+            if (after(i) != 0) continue;
+            for (int tile = 1; tile <= 2; ++tile) {
+                Board64 b = after;
+                b.Set(i, tile);
+                out << Pad(depth) << (tile == 1 ? "2" : "4") << " at cell " << i << " (p " << (tile == 1 ? "0.9" : "0.1")
+                    << "/" << n << ")\n";
+                float v = Max(b, ply, stage, depth + 1);
+                out << Pad(depth) << "  best " << Num(v) << "\n";
+                total += (tile == 1 ? 0.9f : 0.1f) * v;
+            }
+        }
+        return n ? total / float(n) : 0.0f;
+    }
+};
+
+int PrintTree(int argc, const char *argv[]) {
+    std::string hex, play_args;
+    int ply = 2, stage_arg = -1;
+    for (int i = 1; i < argc; i++) {
+        std::string para(argv[i]);
+        std::string value = para.substr(para.find('=') + 1);
+        if (para.find("--tree=") == 0) hex = value;
+        else if (para.find("--tree-ply=") == 0) ply = std::stoi(value);
+        else if (para.find("--tree-stage=") == 0) stage_arg = std::stoi(value);
+        else if (para.find("--play=") == 0) play_args = value;
+        else throw std::invalid_argument("--tree takes no other option: " + para);
+    }
+    if (hex.size() != 16 || ply < 1 || ply > 3) throw std::invalid_argument("usage: --tree=<16 hex digits> --tree-ply=1..3");
+    board_t real = 0;
+    for (int i = 0; i < 16; ++i) real |= board_t(std::stoi(hex.substr(i, 1), nullptr, 16)) << (4 * i);
+    TdPlayer player(play_args + " ply=" + std::to_string(ply));
+    auto learner = player.shared_learner();
+    if (stage_arg > 0) { // a board at that split, so the game stage starts there
+        board_t s = 0;
+        for (int k = 0; k < stage_arg; ++k) s |= board_t(14 - k) << (4 * k);
+        player.Observe(Board64(s));
+    }
+    player.Observe(Board64(real));
+    int stage = std::max(stage_arg, learner->Split(real));
+    board_t root = real;
+    std::ostream &out = std::cout;
+    out << "real root:" << TreePrinter::Tiles(real) << "\n";
+    if (player.DowngradeRank() > 0) {
+        board_t d = DowngradeRoot(real, player.DowngradeRank());
+        if (d != real) {
+            root = d;
+            stage = learner->Split(d);
+            out << "root downgrade, the whole tree plays the halved board:" << TreePrinter::Tiles(d) << "\n";
+        }
+    } else if (player.LeafDowngradeRank() > 0) {
+        out << "leaf downgrade: the tree plays the real board, each leaf is halved on its own\n";
+    }
+    out << "stage " << stage << ", " << ply << "-ply\n\n";
+    TreePrinter printer{*learner, player.LeafDowngradeRank(), out};
+    float printed[4];
+    for (int d = 0; d < 4; ++d) {
+        Board64 child(root);
+        reward_t reward = child.Slide(d);
+        printed[d] = -INFINITY;
+        if (reward == -1) continue;
+        out << "URDL"[d] << " +" << reward << "  after:" << TreePrinter::Tiles(child.GetBoard()) << "\n";
+        printed[d] = reward + (ply <= 1 ? printer.Leaf(child.GetBoard(), stage, 1, d, reward)
+                                        : printer.Chance(child, ply - 1, stage, 1));
+        out << "== " << "URDL"[d] << " " << TreePrinter::Num(printed[d]) << "\n\n";
+    }
+    TdPlayer::Explanation e = player.Explain(Board64(real));
+    bool same = true;
+    out << "search values:";
+    for (int d = 0; d < 4; ++d) {
+        out << ' ' << "URDL"[d] << '=' << (e.search[d] == -INFINITY ? std::string("-") : TreePrinter::Num(e.search[d]));
+        same = same && (e.search[d] == printed[d] || std::fabs(e.search[d] - printed[d]) < 1e-3f * std::fabs(e.search[d]) + 0.05f);
+    }
+    out << (same ? "  (match the tree)" : "  (DIFFER from the tree)") << "\n";
+    return same ? 0 : 2;
+}
+
 int run(int argc, const char *argv[]) {
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]).find("--merge=") == 0) return MergeCheckpoints(argc, argv);
+        if (std::string(argv[i]).find("--explain=") == 0) return ExplainGames(argc, argv);
+        if (std::string(argv[i]).find("--tree=") == 0) return PrintTree(argc, argv);
     }
     size_t total = 1000;
     size_t block = 0;
