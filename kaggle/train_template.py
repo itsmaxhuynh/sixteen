@@ -29,6 +29,9 @@
 # or with 'fixed_alpha' that alpha for every game, no annealing (takes precedence over restart_alpha).
 # Every step resumes: the checkpoint and board files are read from /kaggle/input (the previous
 # version's output) and written to /kaggle/working.
+# Break starts ('extra_share': p, single-stage sessions only): push.sh EXTRA=<file> packs a StartPositions
+# file for the stage into the sources as extra-starts.bin, and a share p of the training games starts from
+# its boards (sixteen --extra-start), e.g. the downgraded boards before the agent's corner breaks.
 # Recollection ('recollect': True, push.sh's default): once per session, before a stage k > 0 trains,
 # the boards at splits 1..k are collected afresh (boards<j+1> by stage j, from fresh boards<j>), so the
 # start boards follow the latest earlier stages instead of the ones that existed when stage k began.
@@ -238,6 +241,16 @@ def recollect(k, ckpt):
                 os.remove(tmp)
 
 
+def extra_args():
+    """--extra-start args for CONFIG extra_share (see the top); the file must have been packed"""
+    if not CONFIG.get("extra_share"):
+        return []
+    path = os.path.join(BUILD, "extra-starts.bin")
+    if not os.path.exists(path):
+        raise SystemExit("extra_share is set but no extra-starts.bin was packed (push.sh EXTRA=<file>)")
+    return [f"--extra-start={path}", f"--extra-share={CONFIG['extra_share']}"]
+
+
 def only_stage_step(ckpt):
     """one step of a single-stage session (see the top); returns (checkpoint, finished)"""
     k = CONFIG["only_stage"]
@@ -269,7 +282,7 @@ def only_stage_step(ckpt):
             total, alpha = train_args(k, games)
         log(f"only stage {k}: {games} games, training {total} more with {alpha}")
         run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}"] +
-            ([f"--start={boards}"] if boards else []) + hard_args(k, meta["stages"]) +
+            ([f"--start={boards}"] if boards else []) + hard_args(k, meta["stages"]) + extra_args() +
             [f"--play=load={ckpt} save={CKPT} stage={k} {alpha} lambda={CONFIG['lambda']}"])
         return CKPT, False
     msg = f"only stage {k}: done, stages trained: {meta['games']}"

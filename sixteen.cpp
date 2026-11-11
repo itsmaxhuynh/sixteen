@@ -8,6 +8,9 @@
  *   hard starts (--learn): --hard=P starts a share P of games from boards rewound 1..--hard-rewind=N
  *   (500) slides before the end of earlier games, kept while still in the active stage (pool of
  *   --hard-pool=N, 100000); --upgrade=Q doubles a tile of a start board with probability Q (HardStarts.h)
+ *   --extra-start=F --extra-share=P (--learn): a share P of games starts from a random board of F (a
+ *   StartPositions file for the active stage, e.g. downgraded boards from before the agent's corner
+ *   breaks); reported apart as "break starts", never upgraded and never fed to the hard pool
  * Merge stages trained in separate sessions (Merge.h):
  *   ./sixteen --merge=out.ckpt base.ckpt 1=s1.ckpt 4=s4.ckpt
  *   common: --threads=N --total=N --block=N --save-every=N --time-limit=SEC --collect-count=N --summary
@@ -192,7 +195,7 @@ class Reporter {
 public:
     explicit Reporter(size_t block) : block_(block), start_(Clock::now()), block_start_(start_) {}
 
-    enum Start { kNormal, kHard, kUpgraded };
+    enum Start { kNormal, kHard, kUpgraded, kExtra };
 
     void Add(const Episode &game, Start start = kNormal) {
         int split = MaxSplit(game);
@@ -204,7 +207,7 @@ public:
         all_games_++;
         all_moves_ += game.step(Action::Slide::type_);
         if (start != kNormal) {
-            Accumulate(start == kHard ? block_hard_ : block_upgraded_, game, split);
+            Accumulate(start == kHard ? block_hard_ : start == kExtra ? block_extra_ : block_upgraded_, game, split);
             return;
         }
         Accumulate(block_acc_, game, split);
@@ -212,11 +215,12 @@ public:
         if (block_acc_.games == block_) {
             auto now = Clock::now();
             double seconds = std::chrono::duration<double>(now - block_start_).count();
-            bool special = block_hard_.games || block_upgraded_.games;
+            bool special = block_hard_.games || block_upgraded_.games || block_extra_.games;
             Print(block_acc_, total_acc_.games, seconds, all_games_, all_moves_, special ? "normal starts" : nullptr);
             PrintSpecial(block_hard_, "hard starts");
             PrintSpecial(block_upgraded_, "upgraded starts");
-            block_acc_ = block_hard_ = block_upgraded_ = {};
+            PrintSpecial(block_extra_, "break starts");
+            block_acc_ = block_hard_ = block_upgraded_ = block_extra_ = {};
             all_games_ = all_moves_ = 0;
             block_start_ = now;
         }
@@ -374,7 +378,7 @@ private:
 
     std::mutex mutex_;
     size_t block_;
-    Acc block_acc_, total_acc_, block_hard_, block_upgraded_;
+    Acc block_acc_, total_acc_, block_hard_, block_upgraded_, block_extra_;
     size_t all_games_ = 0, all_moves_ = 0;
     double move_time_ = 0, move_time_max_ = 0;
     size_t moves_over_limit_ = 0;
@@ -715,6 +719,8 @@ int run(int argc, const char *argv[]) {
     std::string play_args;
     std::string evil_args;
     std::string start_path;
+    std::string extra_path;
+    double extra_share = 0;
     std::string collect_path;
     std::string record_path;
     unsigned record_tile = 32768;
@@ -759,6 +765,10 @@ int run(int argc, const char *argv[]) {
             hard_pool = std::stoull(value);
         } else if (para.find("--upgrade=") == 0) {
             upgrade = std::stod(value);
+        } else if (para.find("--extra-start=") == 0) {
+            extra_path = value;
+        } else if (para.find("--extra-share=") == 0) {
+            extra_share = std::stod(value);
         } else if (para.find("--record=") == 0) {
             record_path = value;
         } else if (para.find("--record-tile=") == 0) {
@@ -779,6 +789,8 @@ int run(int argc, const char *argv[]) {
     if (hard < 0 || hard > 1 || upgrade < 0 || upgrade > 1) throw std::invalid_argument("--hard and --upgrade are probabilities");
     if (hard > 0 && (hard_rewind < 1 || hard_pool < 1)) throw std::invalid_argument("--hard-rewind and --hard-pool must be >= 1");
     if (record_path.size() && learning) throw std::invalid_argument("--record is for evaluation, not --learn");
+    if (extra_path.empty() == (extra_share > 0)) throw std::invalid_argument("--extra-start and --extra-share > 0 go together");
+    if (extra_path.size() && (!learning || extra_share > 1)) throw std::invalid_argument("--extra-start is for --learn, with --extra-share in (0, 1]");
     if (wide && learning) throw std::invalid_argument("--wide is for evaluation, not --learn");
     if (!block) block = total;
 
@@ -803,6 +815,17 @@ int run(int argc, const char *argv[]) {
         std::cerr << "start positions: " << starts.size() << " boards for stage " << start_stage << std::endl;
     } else if (active > 0 && (learning || collect_path.size())) {
         throw std::invalid_argument("stage " + std::to_string(active) + " needs --start=<boards collected at its split>");
+    }
+
+    std::vector<StartPosition> extra;
+    if (extra_path.size()) {
+        int extra_stage;
+        extra = StartPositions::Load(extra_path, extra_stage);
+        if (extra_stage != active) {
+            throw std::invalid_argument(extra_path + " starts stage " + std::to_string(extra_stage) +
+                                        " but the active stage is " + std::to_string(active));
+        }
+        std::cerr << "break starts: " << extra_share << " of games from " << extra.size() << " boards in " << extra_path << std::endl;
     }
 
     // Collection: play with the current weights and record the board (player to move) the first
@@ -888,11 +911,15 @@ int run(int argc, const char *argv[]) {
             if (hard > 0 && coin(hard_rng) < hard && hard_starts.Sample(hard_rng, hp)) {
                 game.Start(hp.board, hp.score);
                 kind = Reporter::kHard;
+            } else if (!extra.empty() && coin(hard_rng) < extra_share) {
+                const StartPosition &e = extra[hard_rng() % extra.size()];
+                game.Start(e.board, e.score);
+                kind = Reporter::kExtra;
             } else if (!starts.empty()) {
                 size_t i = learning ? size_t((round_robin_base + n) % starts.size()) : size_t(start_rng() % starts.size());
                 game.Start(starts[i].board, starts[i].score);
             }
-            if (upgrade > 0 && game.FirstSlide() == 0 && coin(hard_rng) < upgrade) {
+            if (upgrade > 0 && kind != Reporter::kExtra && game.FirstSlide() == 0 && coin(hard_rng) < upgrade) {
                 board_t up = UpgradeTile(game.StartBoard(), active);
                 if (up != game.StartBoard()) {
                     game.Start(up, game.score());

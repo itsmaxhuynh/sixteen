@@ -8,6 +8,8 @@
 #   SEED: an extra kernel to resume from on the first push of an experiment (e.g. sixteen-train, to
 #         start from the main run's checkpoint); later pushes list only the kernel itself
 #   exit status: 0 pushed, 75 all of Kaggle's batch CPU sessions are busy (retry later), else failed
+#   EXTRA: a StartPositions file packed into the sources as extra-starts.bin, for 'extra_share'
+#          (break starts, see kaggle/train_template.py)
 #   MIN_GAMES: the session refuses to train unless it finds a checkpoint with at least this many
 #              games in total (kaggle/chain.sh sets it), so a broken chain never restarts from scratch
 #
@@ -28,7 +30,14 @@ slug="sixteen-${exp:-train}"
 out="kaggle/build${exp:+-$exp}"
 
 mkdir -p "$out"
-sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
+extra_dir=$(mktemp -d)
+trap 'rm -rf "$extra_dir"' EXIT
+if [ -n "${EXTRA:-}" ]; then
+  cp "$EXTRA" "$extra_dir/extra-starts.bin"
+  sources=$(tar czf - makefile *.h sixteen.cpp -C "$extra_dir" extra-starts.bin | base64 -w0)
+else
+  sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
+fi
 # Per stage (list index = stage): alpha schedule ('step' as in [MS-TD], or 'cos' annealing down to
 # alpha_min) and the value every board starts at when the stage is created (0 = [MS-TD]'s zero init,
 # e.g. 320000 = optimistic init). Only stages that have not started yet should be changed.
@@ -103,6 +112,15 @@ case "$exp" in
     # x5u1-x5u4 are left out (float32-damaged late in training, see above).
     collect_from=$(python3 -c "import sys; k = int(sys.argv[1]); print({j: ['sixteen-x5v0', 'sixteen-x5u0'] if j == 0 else [f'sixteen-x5v{j}', f'sixteen-x5t{j}'] for j in range(k)})" "$k")
     override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'fixed_alpha': 0.000025, 'collect_from': $collect_from}" ;;
+  # x5w1, x5w2: stage k again from x5t<k> (30M games) at x5v's fixed alpha, with a fifth of the games
+  # started from the downgraded boards before the agent's corner breaks (EXTRA=<boards for stage k>, made
+  # from recorded games at ply=3 use=0,1,2,2,2 downgrade=32768). No recollection: x5t<k>'s boards.
+  # Push: EXP=x5w<k> SEED=sixteen-x5t<k> MIN_GAMES=70000000 EXTRA=<file>. Merge with base sixteen-x5.
+  x5w[1-2])
+    k=${exp#x5w}
+    targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([40000000 if s == k else 10000000 for s in range(5)])" "$k")
+    [ -n "${EXTRA:-}" ] || { echo "EXP=$exp needs EXTRA=<boards file for stage $k>" >&2; exit 1; }
+    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'fixed_alpha': 0.000025, 'recollect': False, 'extra_share': 0.2}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
