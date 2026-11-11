@@ -233,7 +233,11 @@ def recollect(k, ckpt):
             log(f"recollection for stage {j + 1} failed ({e}), keeping {dest}")
         have = distinct_boards(tmp)
         if have >= CONFIG["collect"]:
-            os.replace(tmp, dest)
+            # BUILD and WORK can be separate filesystems (Kaggle: /tmp and /kaggle/working), where a
+            # rename fails: copy next to dest, then rename there (atomic, same filesystem)
+            shutil.copy(tmp, dest + ".part")
+            os.replace(dest + ".part", dest)
+            os.remove(tmp)
             log(f"boards for stage {j + 1}: {have} fresh boards in {dest}")
         else:
             log(f"recollection for stage {j + 1} got {have}/{CONFIG['collect']} boards, keeping {dest}")
