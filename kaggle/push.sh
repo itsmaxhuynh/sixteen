@@ -123,6 +123,15 @@ case "$exp" in
     [ -n "${EXTRA:-}" ] || { echo "EXP=$exp needs EXTRA=<boards file for stage $k>" >&2; exit 1; }
     collect_from=$(python3 -c "import sys; k = int(sys.argv[1]); print({j: ['sixteen-x5u0'] if j == 0 else [f'sixteen-x5t{j}'] for j in range(k)})" "$k")
     override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'fixed_alpha': 0.000025, 'collect_from': $collect_from, 'extra_share': 0.2}" ;;
+  # x5x1, x5x2: x5w<k> (break starts, recollected boards) with a warm restart instead of the fixed
+  # alpha: 5M games (30M -> 35M) from x5t<k> on one cosine from 2.5e-04 down to 2.5e-05.
+  # Push: EXP=x5x<k> SEED=sixteen-x5t<k> MIN_GAMES=70000000 EXTRA=<file>. Merge with base sixteen-x5.
+  x5x[1-2])
+    k=${exp#x5x}
+    targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([35000000 if s == k else 10000000 for s in range(5)])" "$k")
+    [ -n "${EXTRA:-}" ] || { echo "EXP=$exp needs EXTRA=<boards file for stage $k>" >&2; exit 1; }
+    collect_from=$(python3 -c "import sys; k = int(sys.argv[1]); print({j: ['sixteen-x5u0'] if j == 0 else [f'sixteen-x5t{j}'] for j in range(k)})" "$k")
+    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'restart_alpha': 0.00025, 'restart_from': 30000000, 'alpha_min': 0.000025, 'collect_from': $collect_from, 'extra_share': 0.2}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
