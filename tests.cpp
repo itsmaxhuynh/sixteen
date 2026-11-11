@@ -1181,6 +1181,37 @@ static void TestCosineAnnealing() {
     for (const std::string &p : {at0, at500, at1000}) std::remove(p.c_str());
 }
 
+// use=<map>: a stage's region is played by the mapped stage's weights; the identity map changes nothing
+static void TestStageMap() {
+    std::string ckpt = SmallCheckpoint("sixteen-use.ckpt", 7);
+    auto base = MakeLearner("load=" + ckpt);                              // stage 0 plays everywhere
+    auto own = MakeLearner("load=" + ckpt + " stage=1 init=500");          // stage 1 values all at 500
+    auto same = MakeLearner("load=" + ckpt + " stage=1 init=500 use=0,1"); // identity map
+    auto mapped = MakeLearner("load=" + ckpt + " stage=1 init=500 use=0,0");
+    std::mt19937_64 rng(5);
+    int bad = 0, split1 = 0;
+    for (int k = 0; k < 4000; ++k) {
+        board_t b = 0;
+        for (int i = 0; i < 16; ++i) b |= board_t(rng() % 3 ? rng() % 15 : 0) << (4 * i);
+        if (rng() % 2) b = (b & ~board_t(0xf)) | 14; // a 16384 in the corner: past the split
+        split1 += SplitLevel(b, 1) == 1;
+        for (int gs = 0; gs < 2; ++gs) {
+            bad += mapped->Evaluate(b, gs) != base->Evaluate(b, gs);
+            bad += same->Evaluate(b, gs) != own->Evaluate(b, gs);
+        }
+        if (SplitLevel(b, 1) == 1) bad += std::fabs(own->Evaluate(b, 1) - 500.0f) > 0.01f; // the map matters here
+    }
+    CHECK(split1 > 1000);
+    CHECK(bad == 0);
+    bool threw = false;
+    try { MakeLearner("load=" + ckpt + " stage=1 use=1,1"); } catch (const std::invalid_argument &) { threw = true; }
+    CHECK(threw); // stage 0 cannot use a later stage
+    threw = false;
+    try { MakeLearner("load=" + ckpt + " stage=1 use=0,0 save=" + ckpt + ".x"); } catch (const std::invalid_argument &) { threw = true; }
+    CHECK(threw); // evaluation only
+    std::remove(ckpt.c_str());
+}
+
 static void TestOptimisticInit() {
     std::string ckpt = SmallCheckpoint("sixteen-oi.ckpt", 7);
     auto base = MakeLearner("load=" + ckpt);
@@ -1559,6 +1590,7 @@ int main() {
     TestTCLearner();
     TestCosineAnnealing();
     TestOptimisticInit();
+    TestStageMap();
     TestDowngrade();
     TestWideBoard();
     TestFit();

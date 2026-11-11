@@ -120,6 +120,9 @@ public:
  *                 (default 0, as in [MS-TD]). Stages that already exist are not touched.
  *   lambda=<f>    paper's final version: 0.5 with returns truncated at 5 steps; 0 = TD(0)
  *   stage=<k>     0-based stage to train (and highest stage used to play); a new stage starts at zero
+ *   use=<s0,s1,..> evaluation only: the weights of stage s_k play where the game is in stage k, e.g.
+ *                 use=0,1,2,2,4 lets stage 2 play on past the third split instead of stage 3 (each
+ *                 s_k <= k; default: every stage plays its own region). Not with save=
  *   tc=1          temporal coherence learning (arXiv:2111.11090 eqs. 7-9) instead of plain TD: each
  *                 weight's step is alpha * |E|/A. E and A (2 floats per weight of the active stage)
  *                 are saved to <save>.tc and read back from <load>.tc when it holds the same stage.
@@ -156,6 +159,20 @@ public:
         if (const std::string *v = Get(args, "alpha_min")) alpha_min_ = std::stof(*v);
         if (const std::string *v = Get(args, "anneal_from")) anneal_from_ = std::stod(*v);
         if (cosine_ && !(anneal_games_ > 0)) throw std::invalid_argument("anneal=cos needs anneal_games > 0");
+        use_.resize(network_.NumStages());
+        for (int k = 0; k < network_.NumStages(); ++k) use_[k] = k;
+        if (const std::string *v = Get(args, "use")) {
+            if (!save_path_.empty()) throw std::invalid_argument("use= is for evaluation, not with save=");
+            std::stringstream in(*v);
+            std::string item;
+            for (int k = 0; std::getline(in, item, ','); ++k) {
+                if (k >= network_.NumStages()) throw std::invalid_argument("use=" + *v + ": more stages than the network has");
+                int s = std::stoi(item);
+                if (s < 0 || s > k) throw std::invalid_argument("use=" + *v + ": stage " + std::to_string(k) + " can only use stages 0.." + std::to_string(k));
+                use_[k] = s;
+            }
+            std::cerr << "stage map: use=" << *v << std::endl;
+        }
         active_games_ = state_.games[state_.active];
         if (const std::string *v = Get(args, "tc")) tc_ = *v == "1";
         if (tc_) {
@@ -390,7 +407,7 @@ private:
                   << init_value_ << ")" << std::endl;
     }
 
-    int Resolve(int game_stage) const { return std::min(game_stage, state_.active); }
+    int Resolve(int game_stage) const { return use_[std::min(game_stage, state_.active)]; }
 
     float Value(board_t b, int game_stage) const {
         return network_.GetValue(b, Resolve(std::max(game_stage, Split(b))));
@@ -464,6 +481,7 @@ private:
     bool tc_ = false, tc_loaded_ = false;
     std::vector<std::vector<float>> tc_e_, tc_a_; // TC accumulators of the active stage
     bool cosine_ = false;
+    std::vector<int> use_; // stage whose weights play in each stage's region (use=, identity by default)
     double anneal_games_ = 0, anneal_from_ = 0;
     float alpha_min_ = 0;
     TrainingState state_;
