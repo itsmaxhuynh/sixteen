@@ -125,10 +125,12 @@ case "$exp" in
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
 
-python3 - "$sources" "$config" > "$out/train.py" <<'EOF'
+# the sources go through a file: with EXTRA they can pass Linux's 128 KB limit on one argument
+printf '%s' "$sources" > "$extra_dir/sources.b64"
+python3 - "$extra_dir/sources.b64" "$config" > "$out/train.py" <<'EOF'
 import sys
 tpl = open("kaggle/train_template.py").read()
-print(tpl.replace("@SOURCES@", sys.argv[1]).replace("@CONFIG@", sys.argv[2]), end="")
+print(tpl.replace("@SOURCES@", open(sys.argv[1]).read()).replace("@CONFIG@", sys.argv[2]), end="")
 EOF
 
 # resume from the previous version's output; the very first push has no output to read yet
