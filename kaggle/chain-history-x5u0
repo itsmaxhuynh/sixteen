@@ -1,2 +1,3 @@
 2026-11-10 11:50 UTC PUSH #1 (manual, SEED=sixteen-x5 MIN_GAMES=50000000): stage 0 only, 10M -> 20M, cosine 2.5e-04 -> 2.5e-06
 2026-11-10 23:43 UTC PUSH #2: from games=52652623 (12652623,10000000,10000000,10000000,10000000) boards=400000
+2026-11-11 03:59 UTC HALT: cancelled by the user; rerun as x5v0 at a fixed alpha of 2.5e-05

@@ -2,4 +2,4 @@ last_games=75100188
 last_boards=400000
 pushed_at=1794354332
 pushes=2
-halted=
+halted=cancelled 2026-11-11 by the user: x5u's cosine went below alpha 1e-05, which damages float32 training; rerun as x5v

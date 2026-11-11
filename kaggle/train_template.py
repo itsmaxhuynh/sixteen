@@ -25,7 +25,8 @@
 # StartPositions.h), playing stages 0..k-1 of its checkpoint from boards<k-1>.bin, then trains stage k
 # up to stage_games[k] and stops. alpha: the stage's own schedule (for 'cos', past its end: alpha_min),
 # or with 'restart_alpha' a fresh cosine from restart_alpha down to alpha_min over the games after
-# 'restart_from' (default games_per_stage, the games the stage had when the extension started).
+# 'restart_from' (default games_per_stage, the games the stage had when the extension started),
+# or with 'fixed_alpha' that alpha for every game, no annealing (takes precedence over restart_alpha).
 # Every step resumes: the checkpoint and board files are read from /kaggle/input (the previous
 # version's output) and written to /kaggle/working.
 import base64, glob, io, os, shutil, subprocess, sys, tarfile, time
@@ -178,7 +179,10 @@ def only_stage_step(ckpt):
     games = meta["games"][k]
     if games < target(k):
         peak = CONFIG.get("restart_alpha")
-        if peak:
+        if CONFIG.get("fixed_alpha"):
+            alpha = f"alpha={CONFIG['fixed_alpha']}"
+            total = target(k) - games
+        elif peak:
             begin = CONFIG.get("restart_from", CONFIG["games_per_stage"])
             alpha = (f"alpha={peak} anneal=cos anneal_games={target(k) - begin} anneal_from={begin} "
                      f"alpha_min={CONFIG['alpha_min']}")

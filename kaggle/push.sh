@@ -88,6 +88,17 @@ case "$exp" in
   # TAAI) on one cosine from 0.00025 down to 2.5e-06, starting from the empty board as in x5.
   # First push: SEED=sixteen-x5 MIN_GAMES=50000000. Merge with base sixteen-x5, 0=sixteen-x5u0.
   x5u0) override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': 0, 'stage_games': [20000000, 10000000, 10000000, 10000000, 10000000], 'restart_alpha': 0.00025, 'restart_from': 10000000, 'alpha_min': 0.0000025}" ;;
+  # x5v0..x5v4: the x5u runs again at a fixed alpha of 2.5e-05, no cosine. x5u's cosine went down to
+  # 2.5e-06, and below ~1e-05 the float32 weights drop most updates (the scalar feature weights are
+  # 30k-174k, where float32 steps are 0.004-0.016), so x5u2-x5u4 got worse late in training.
+  # x5v1..x5v4 train stage k 30M -> 40M from x5t<k>'s finished checkpoint and boards. First push:
+  # SEED=sixteen-x5t<k> MIN_GAMES=70000000. x5v0 trains stage 0 on to 20M from x5u0's first session
+  # (12.65M games, still at alpha ~2.4e-04, undamaged). First push: SEED=sixteen-x5u0
+  # MIN_GAMES=52652623. Merge with base sixteen-x5, k=sixteen-x5v<k> (0=sixteen-x5v0).
+  x5v[0-4])
+    k=${exp#x5v}
+    targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([(20000000 if k == 0 else 40000000) if s == k else 10000000 for s in range(5)])" "$k")
+    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'fixed_alpha': 0.000025}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
