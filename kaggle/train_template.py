@@ -29,6 +29,14 @@
 # or with 'fixed_alpha' that alpha for every game, no annealing (takes precedence over restart_alpha).
 # Every step resumes: the checkpoint and board files are read from /kaggle/input (the previous
 # version's output) and written to /kaggle/working.
+# Recollection ('recollect': True, push.sh's default): once per session, before a stage k > 0 trains,
+# the boards at splits 1..k are collected afresh (boards<j+1> by stage j, from fresh boards<j>), so the
+# start boards follow the latest earlier stages instead of the ones that existed when stage k began.
+# Stage j plays from the checkpoint picked by collector_ckpt: among 'collect_from'[j] (kernel slugs
+# whose output push.sh mounts, e.g. {0: ['sixteen-x5v0', 'sixteen-x5u0']}) and this run's own
+# checkpoint, the one with the most stage-j games. Those kernels' checkpoints and boards are only
+# read for that: they are never resumed from or carried into the output. A collection that falls
+# short keeps the boards it would have replaced.
 import base64, glob, io, os, shutil, subprocess, sys, tarfile, time
 
 SOURCES_B64 = "@SOURCES@"
@@ -95,6 +103,17 @@ def run(args):
         raise SystemExit(f"sixteen exited with {rc}")
 
 
+def collect_sources():
+    """slugs of the kernels mounted only to collect boards with (CONFIG collect_from)"""
+    return {slug for slugs in CONFIG.get("collect_from", {}).values() for slug in slugs}
+
+
+def from_source(path, slugs=None):
+    """true if path lies in the mounted output of one of the slugs (default: every collect source)"""
+    parts = os.path.normpath(path).split(os.sep)
+    return any(slug in parts for slug in (collect_sources() if slugs is None else slugs))
+
+
 def setup():
     os.makedirs(BUILD, exist_ok=True)
     os.makedirs(WORK, exist_ok=True)
@@ -104,12 +123,16 @@ def setup():
     # newest checkpoint = most total training games
     best = None
     for path in glob.glob(os.path.join(INPUT, "**", "sixteen.ckpt"), recursive=True):
+        if from_source(path):
+            continue
         meta = info(path)
         log(f"found {path}: active stage {meta['active']}, games {meta['games']}")
         if best is None or sum(meta["games"]) > sum(best[1]["games"]):
             best = (path, meta)
     # board files are small: carry the largest of each forward into the output
     for path in glob.glob(os.path.join(INPUT, "**", "boards*.bin"), recursive=True):
+        if from_source(path):
+            continue
         dest = os.path.join(WORK, os.path.basename(path))
         if board_count(path) > board_count(dest):
             shutil.copy(path, dest)
@@ -162,6 +185,59 @@ def train_args(k, games):
             f"alpha={0.00025 if decayed else 0.0025}")
 
 
+def collector_ckpt(j, own):
+    """checkpoint to collect boards<j+1> with: the most stage-j games among collect_from[j] and own"""
+    best, best_games = own, info(own)["games"][j]
+    slugs = CONFIG.get("collect_from", {}).get(j, [])
+    for path in sorted(glob.glob(os.path.join(INPUT, "**", "sixteen.ckpt"), recursive=True)):
+        if not from_source(path, slugs):
+            continue
+        try:
+            meta = info(path)
+        except subprocess.CalledProcessError:
+            log(f"collect source {path} does not load, skipped")
+            continue
+        if meta["stages"] <= j + 1:
+            continue
+        log(f"collect source for stage {j}: {path}, stage {j} has {meta['games'][j]} games")
+        if meta["games"][j] > best_games:
+            best, best_games = path, meta["games"][j]
+    return best, best_games
+
+
+REFRESHED = set()  # stages whose start boards were collected in this session
+
+
+def recollect(k, ckpt):
+    """once per session: collect boards<1..k> afresh (see the top); a short collection keeps the old file"""
+    if not CONFIG.get("recollect") or k == 0 or k in REFRESHED:
+        return
+    for j in range(k):
+        if j + 1 in REFRESHED:
+            continue
+        REFRESHED.add(j + 1)
+        src, games = collector_ckpt(j, ckpt)
+        dest = boards_path(j + 1)
+        tmp = os.path.join(BUILD, f"boards{j + 1}.fresh.bin")  # not in WORK: never part of the output
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log(f"recollecting {CONFIG['collect']} boards for stage {j + 1} with stage {j} of {src} ({games} games)")
+        start = [f"--start={boards_path(j)}"] if j > 0 else []
+        try:
+            run([f"--collect={tmp}", f"--collect-count={CONFIG['collect']}", "--total=1000000000000"] + start +
+                [f"--play=load={src} stage={j}"])
+        except SystemExit as e:
+            log(f"recollection for stage {j + 1} failed ({e}), keeping {dest}")
+        have = distinct_boards(tmp)
+        if have >= CONFIG["collect"]:
+            os.replace(tmp, dest)
+            log(f"boards for stage {j + 1}: {have} fresh boards in {dest}")
+        else:
+            log(f"recollection for stage {j + 1} got {have}/{CONFIG['collect']} boards, keeping {dest}")
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+
 def only_stage_step(ckpt):
     """one step of a single-stage session (see the top); returns (checkpoint, finished)"""
     k = CONFIG["only_stage"]
@@ -169,6 +245,8 @@ def only_stage_step(ckpt):
     if not 0 <= k < meta["stages"]:
         raise SystemExit(f"only_stage={k}: needs a stage from 0 to {meta['stages'] - 1}")
     boards = boards_path(k) if k > 0 else None
+    if boards:
+        recollect(k, ckpt)
     have = distinct_boards(boards) if boards else 0
     if boards and have < CONFIG["collect"]:
         log(f"only stage {k}: {have}/{CONFIG['collect']} distinct boards in {boards}, collecting with stage {k - 1}")
@@ -234,6 +312,7 @@ def main():
         start = [f"--start={boards_path(k)}"] if k > 0 else []
 
         if games < target(k):
+            recollect(k, ckpt)
             total, alpha = train_args(k, games)
             log(f"stage {k}: {games} games, training {total} more with {alpha}")
             run(["--learn", f"--total={total}", f"--save-every={CONFIG['save_every']}"] + start +
@@ -246,6 +325,7 @@ def main():
                 log(f"stage {k} done, collecting boards for stage {k + 1}: {board_count(nxt)}/{CONFIG['collect']}")
                 run([f"--collect={nxt}", f"--collect-count={CONFIG['collect']}", "--total=1000000000000"] + start +
                     [f"--play=load={ckpt}"])
+                REFRESHED.add(k + 1)  # just collected with the latest stage k
             else:
                 init = stage_setting("init", k + 1, 0)
                 log(f"starting stage {k + 1} from {board_count(nxt)} boards, init={init}")

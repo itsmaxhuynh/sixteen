@@ -36,7 +36,7 @@ sources=$(tar czf - makefile *.h sixteen.cpp | base64 -w0)
 # that stage 0 and start their fine-tune games after it, so changing it here affects new runs only.
 anneal="['cos', 'cos', 'cos', 'cos', 'cos']"
 init="[0, 0, 0, 0, 0]"
-config="{'stages': 5, 'lambda': 0.5, 'games_per_stage': 10000000, 'decay_at': 5000000, 'collect': 100000, 'hours': $hours, 'margin_minutes': 20, 'threads': None, 'block': 10000, 'save_every': 200000, 'min_games': ${MIN_GAMES:-0}, 'anneal': $anneal, 'alpha_min': 0.000025, 'init': $init}"
+config="{'stages': 5, 'lambda': 0.5, 'games_per_stage': 10000000, 'decay_at': 5000000, 'collect': 100000, 'hours': $hours, 'margin_minutes': 20, 'threads': None, 'block': 10000, 'save_every': 200000, 'min_games': ${MIN_GAMES:-0}, 'anneal': $anneal, 'alpha_min': 0.000025, 'init': $init, 'recollect': True}"
 
 # Experiments: the main config with some keys replaced.
 # x3a / x3b: arXiv:2111.11090's best design, OTD+TC on the 8x6-tuple network with 2 stages (split
@@ -98,7 +98,11 @@ case "$exp" in
   x5v[0-4])
     k=${exp#x5v}
     targets=$(python3 -c "import sys; k = int(sys.argv[1]); print([(20000000 if k == 0 else 40000000) if s == k else 10000000 for s in range(5)])" "$k")
-    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'fixed_alpha': 0.000025}" ;;
+    # Start boards: recollected every session (recollect) with the newest undamaged earlier stages:
+    # stage 0 from x5v0 (x5u0 until x5v0 has more games), stage j > 0 from x5v<j> (else x5t<j>);
+    # x5u1-x5u4 are left out (float32-damaged late in training, see above).
+    collect_from=$(python3 -c "import sys; k = int(sys.argv[1]); print({j: ['sixteen-x5v0', 'sixteen-x5u0'] if j == 0 else [f'sixteen-x5v{j}', f'sixteen-x5t{j}'] for j in range(k)})" "$k")
+    override="{'patterns': '8x6', 'hard': 0.5, 'hard_rewind': 500, 'upgrade': 0.3, 'only_stage': $k, 'stage_games': $targets, 'fixed_alpha': 0.000025, 'collect_from': $collect_from}" ;;
   *) echo "unknown EXP=$exp" >&2; exit 1 ;;
 esac
 config=$(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); c.update(ast.literal_eval(sys.argv[2])); print(repr(c))" "$config" "$override")
@@ -119,6 +123,10 @@ fi
 if [ -n "${SEED:-}" ]; then
   self_source="${self_source:+$self_source, }\"$user/$SEED\""
 fi
+# kernels whose checkpoints only collect start boards (collect_from, see train_template.py)
+for src in $(python3 -c "import ast, sys; c = ast.literal_eval(sys.argv[1]); print(' '.join(sorted({s for v in c.get('collect_from', {}).values() for s in v} - {sys.argv[2], sys.argv[3]})))" "$config" "$slug" "${SEED:-}"); do
+  self_source="${self_source:+$self_source, }\"$user/$src\""
+done
 
 cat > "$out/kernel-metadata.json" <<EOF
 {
